@@ -1,0 +1,4 @@
+*.pyc
+entry.py
+Dockerfile
+agent_config.json
