@@ -906,20 +906,6 @@ class NetworkInspectorFeature:
         }
 
     @mcp_tool(
-        name="browser_start_capture",
-        examples=["browser_start_capture()"],
-    )
-    async def mcp_browser_start_capture(self) -> Dict[str, Any]:
-        return await self.start_capture(self._require_run_state())
-
-    @mcp_tool(
-        name="browser_stop_capture",
-        examples=["browser_stop_capture()"],
-    )
-    async def mcp_browser_stop_capture(self) -> Dict[str, Any]:
-        return await self.stop_capture(self._require_run_state())
-
-    @mcp_tool(
         name="browser_list_requests",
         examples=[
             "browser_list_requests(limit=50, offset=0)",
@@ -937,6 +923,39 @@ class NetworkInspectorFeature:
         url_contains: str = "",
         url_regex: str = "",
     ) -> Dict[str, Any]:
+        """
+        List captured network request/response records with filtering and pagination.
+
+        Args:
+            limit (optional): Max records to return in this page.
+                Effective range: [1..500]. Default: `100`.
+            offset (optional): Zero-based index of first record. Must be integer >= 0.
+                Default: `0`.
+            resource_type (optional): Exact Playwright resource type filter.
+                Common values: [`document`, `stylesheet`, `script`, `image`, `media`,
+                `font`, `xhr`, `fetch`, `eventsource`, `websocket`, `manifest`, `other`].
+                Empty means no resource-type filter.
+            mime_type (optional): Case-insensitive MIME substring filter
+                (e.g. `application/json`, `text/html`, `javascript`).
+            status_min (optional): Minimum HTTP status code (inclusive), e.g. `400`.
+            status_max (optional): Maximum HTTP status code (inclusive), e.g. `599`.
+            url_contains (optional): Case-insensitive URL substring filter.
+            url_regex (optional): URL regex filter (Python regex syntax).
+
+        Returns:
+            Dict pagination envelope:
+            - ok (bool): Whether query succeeded.
+            - total (int): Total records after filters.
+            - offset (int): Applied offset.
+            - limit (int): Applied limit.
+            - has_more (bool): Whether more pages exist.
+            - items (list[dict]): Full raw request/response records.
+
+        Examples:
+            await mcp_browser_list_requests(limit=50, offset=0)
+            await mcp_browser_list_requests(mime_type="application/json", url_contains="/api/")
+            await mcp_browser_list_requests(status_min=400, status_max=599)
+        """
         return await self.list_requests(
             self._require_run_state(),
             limit=limit,
@@ -963,6 +982,32 @@ class NetworkInspectorFeature:
         level: str = "",
         text_contains: str = "",
     ) -> Dict[str, Any]:
+        """
+        List captured browser console/pageerror entries with filtering and pagination.
+
+        Args:
+            limit (optional): Max records to return in this page.
+                Effective range: [1..500]. Default: `100`.
+            offset (optional): Zero-based index of first record. Must be integer >= 0.
+                Default: `0`.
+            level (optional): Exact console level filter.
+                Common values: [`log`, `info`, `warn`, `error`, `debug`, `pageerror`].
+                Empty means no level filter.
+            text_contains (optional): Case-insensitive text substring filter.
+
+        Returns:
+            Dict pagination envelope:
+            - ok (bool): Whether query succeeded.
+            - total (int): Total records after filters.
+            - offset (int): Applied offset.
+            - limit (int): Applied limit.
+            - has_more (bool): Whether more pages exist.
+            - items (list[dict]): Raw console/error entries.
+
+        Examples:
+            await mcp_browser_list_console(limit=100, offset=0)
+            await mcp_browser_list_console(level="error", text_contains="failed")
+        """
         return await self.list_console(
             self._require_run_state(),
             limit=limit,
@@ -984,6 +1029,36 @@ class NetworkInspectorFeature:
         request_id: str = "",
         encoding: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """
+        Fetch stored raw response payload for a captured resource by `request_id` or URL.
+
+        Args:
+            url (optional): Exact resource URL to resolve (used when `request_id` is omitted).
+            request_id (optional): Stable captured request ID (preferred lookup key).
+            encoding (optional): Output conversion hint.
+                - `text`: decode base64 payload to UTF-8 when possible
+                - `base64`: base64-encode text payload
+                - None: keep stored representation
+                Allowed values: [`text`, `base64`, null/omitted].
+
+        Returns:
+            Dict with payload details:
+            - ok (bool): Whether resource lookup succeeded.
+            - request_id (str): Captured request identifier.
+            - url (str): Resource URL.
+            - mime_type (str): Response MIME type.
+            - status_code (int | null): HTTP status code.
+            - response_headers (dict): Raw response headers.
+            - response_body_kind (str): `text` or `base64`.
+            - response_body (str | null): Raw response payload.
+            - response_body_size (int): Original body size in bytes.
+            - response_body_truncated (bool): Whether payload exceeded capture cap.
+            - is_download (bool): Download heuristic outcome.
+
+        Examples:
+            await mcp_browser_get_resource_source(request_id="0f8fad5b-d9cb-469f-a165-70867728950e")
+            await mcp_browser_get_resource_source(url="https://example.com/app.js", encoding="text")
+        """
         return await self.get_resource_source(
             self._require_run_state(),
             url=url,
@@ -1004,6 +1079,32 @@ class NetworkInspectorFeature:
         offset: int = 0,
         event_type: str = "",
     ) -> Dict[str, Any]:
+        """
+        List captured websocket events/frames with pagination.
+
+        Args:
+            limit (optional): Max websocket events to return.
+                Effective range: [1..500]. Default: `100`.
+            offset (optional): Zero-based index of first websocket event.
+                Must be integer >= 0. Default: `0`.
+            event_type (optional): Exact websocket event filter.
+                Allowed values: [`websocket_open`, `websocket_frame_received`,
+                `websocket_frame_sent`, `websocket_close`].
+                Empty means no event-type filter.
+
+        Returns:
+            Dict pagination envelope:
+            - ok (bool): Whether query succeeded.
+            - total (int): Total websocket records after filter.
+            - offset (int): Applied offset.
+            - limit (int): Applied limit.
+            - has_more (bool): Whether more pages exist.
+            - items (list[dict]): Raw websocket event/frame records.
+
+        Examples:
+            await mcp_browser_list_websocket_frames(limit=100, offset=0)
+            await mcp_browser_list_websocket_frames(event_type="websocket_frame_received")
+        """
         return await self.list_websocket_frames(
             self._require_run_state(),
             limit=limit,

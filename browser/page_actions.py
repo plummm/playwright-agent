@@ -459,17 +459,30 @@ class PageActionsFeature:
     )
     async def mcp_browser_navigate(self, url: str, wait_until: str = "load") -> Dict[str, Any]:
         """
-        Navigate the active browser page to a target URL and take a screenshot of the page.
+        Navigate the active page to a target URL and capture a post-navigation screenshot.
 
         Args:
             url: Absolute URL to open in the current page.
-            wait_until: Page readiness condition (`load`, `domcontentloaded`, `networkidle`, or `commit`).
+            wait_until (optional): Page readiness condition.
+                Allowed values: [`load`, `domcontentloaded`, `networkidle`, `commit`].
+                Any other value falls back to `load`.
 
         Returns:
-            A dictionary containing navigation outcome metadata such as final URL, status code, and title.
+            Dict with navigation metadata:
+            - ok (bool): Whether navigation completed.
+            - requested_url (str): URL requested by the caller.
+            - final_url (str): Final URL after redirects/navigation.
+            - response_url (str | null): URL from the navigation response object.
+            - status_code (int | null): HTTP status when available.
+            - title (str): Current page title after navigation.
+            - wait_until (str): Effective wait mode used.
+            - screenshot (dict): Result from `browser_screenshot`.
+            - capture_delta (dict, optional): Newly captured network/console records
+              since this navigate call started (when network inspector is enabled).
 
-        Example:
+        Examples:
             await mcp_browser_navigate(url="https://example.com", wait_until="load")
+            await mcp_browser_navigate(url="https://news.ycombinator.com", wait_until="domcontentloaded")
         """
         return await self.navigate(self._require_run_state(), url=url, wait_until=wait_until)
 
@@ -485,14 +498,21 @@ class PageActionsFeature:
         Capture a screenshot of the active browser page.
 
         Args:
-            path: Optional filesystem path for saving the screenshot. If omitted, a default run path is used.
-            full_page: Whether to capture the full scrollable page instead of only the viewport.
+            path (optional): Filesystem path to save screenshot. If empty/omitted,
+                a default run-scoped path is used.
+            full_page (optional): Whether to capture full scrollable page.
+                Allowed values: [`true`, `false`]. Default: `true`.
 
         Returns:
-            A dictionary with saved path, byte size, URL, and capture options.
+            Dict with screenshot payload:
+            - ok (bool): Whether screenshot capture succeeded.
+            - image_base64 (str): PNG bytes encoded as base64.
+            - full_page (bool): Whether full-page mode was used.
+            - url (str): Current page URL at capture time.
 
-        Example:
+        Examples:
             await mcp_browser_screenshot(full_page=True)
+            await mcp_browser_screenshot(path="/tmp/playwright_agent/shot.png", full_page=False)
         """
         normalized_path = path.strip() or None
         return await self.screenshot(
@@ -514,13 +534,19 @@ class PageActionsFeature:
 
         Args:
             selector: Playwright selector expression for the target element.
-            timeout_ms: Optional click timeout in milliseconds.
+            timeout_ms (optional): Click timeout in milliseconds.
+                If omitted, run default timeout is used.
 
         Returns:
-            A dictionary with selector, timeout, URL, and success flag.
+            Dict with click execution metadata:
+            - ok (bool): Whether click succeeded.
+            - selector (str): Selector used for the click.
+            - timeout_ms (int): Effective timeout used.
+            - url (str): Current page URL after the click.
 
-        Example:
+        Examples:
             await mcp_browser_click(selector="#login-button", timeout_ms=5000)
+            await mcp_browser_click(selector="text=Sign in")
         """
         return await self.click(
             self._require_run_state(),
@@ -547,13 +573,21 @@ class PageActionsFeature:
         Args:
             selector: Playwright selector expression for the input target.
             text: Text value to enter.
-            delay_ms: Optional per-keystroke delay in milliseconds.
+            delay_ms (optional): Per-keystroke delay in milliseconds.
+                If `delay_ms <= 0` or omitted, the tool uses fast deterministic `fill()`.
+                If `delay_ms > 0`, the tool uses `type()` with the specified delay.
 
         Returns:
-            A dictionary with selector, character count, URL, and typing options.
+            Dict with typing metadata:
+            - ok (bool): Whether typing succeeded.
+            - selector (str): Selector used for input.
+            - chars (int): Number of characters sent.
+            - delay_ms (int): Effective key delay used (0 when using fill mode).
+            - url (str): Current page URL after typing.
 
-        Example:
+        Examples:
             await mcp_browser_type_text(selector='input[name=search]', text='moose framework')
+            await mcp_browser_type_text(selector='#email', text='user@example.com', delay_ms=40)
         """
         return await self.type_text(
             self._require_run_state(),
@@ -575,13 +609,19 @@ class PageActionsFeature:
 
         Args:
             key: Playwright key name (for example `Enter`, `Escape`, `Tab`).
-            selector: Optional selector to target a specific element before key press.
+            selector (optional): Selector to target a specific element before key press.
+                If omitted, key is pressed at page keyboard level.
 
         Returns:
-            A dictionary with key, selector, URL, and success flag.
+            Dict with key-press metadata:
+            - ok (bool): Whether key press succeeded.
+            - key (str): Key that was pressed.
+            - selector (str | null): Selector targeted (null when global keyboard press).
+            - url (str): Current page URL after the key press.
 
-        Example:
+        Examples:
             await mcp_browser_press_key(key="Enter")
+            await mcp_browser_press_key(key="Escape", selector="input[name=q]")
         """
         return await self.press_key(
             self._require_run_state(),
@@ -604,7 +644,31 @@ class PageActionsFeature:
         timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        Move cursor to an element using coordinates derived from Playwright bounding box.
+        Move cursor to an element using coordinates derived from element bounding box.
+
+        Args:
+            selector: Playwright selector for the target element.
+            position (optional): Target point on the element.
+                Allowed values: [`center`, `top_left`, `top_right`, `bottom_left`, `bottom_right`].
+                Any other value falls back to `center`.
+            steps (optional): Interpolation steps for mouse movement animation.
+                Must be an integer >= 1. Default: `20`.
+            timeout_ms (optional): Timeout for locating/scrolling target element in ms.
+                If omitted, run default timeout is used.
+
+        Returns:
+            Dict with mouse-move metadata:
+            - ok (bool): Whether move succeeded.
+            - selector (str): Selector used.
+            - position (str): Position mode used to compute x/y.
+            - x (float): Final x coordinate used.
+            - y (float): Final y coordinate used.
+            - steps (int): Effective movement steps.
+            - url (str): Current page URL.
+
+        Examples:
+            await mcp_browser_move_cursor(selector="button[type=submit]")
+            await mcp_browser_move_cursor(selector="#chart", position="top_left", steps=30)
         """
         return await self.move_cursor(
             self._require_run_state(),
@@ -632,6 +696,37 @@ class PageActionsFeature:
     ) -> Dict[str, Any]:
         """
         Click an element using explicit mouse coordinates (computed from element geometry).
+
+        Args:
+            selector: Playwright selector for the target element.
+            position (optional): Target point on the element.
+                Allowed values: [`center`, `top_left`, `top_right`, `bottom_left`, `bottom_right`].
+                Any other value falls back to `center`.
+            button (optional): Mouse button.
+                Allowed values: [`left`, `middle`, `right`].
+                Any other value falls back to `left`.
+            click_count (optional): Number of clicks to issue. Must be integer >= 1.
+                Default: `1`.
+            delay_ms (optional): Delay between mouse down/up in milliseconds.
+                Must be integer >= 0. Default: `0`.
+            timeout_ms (optional): Timeout for locating/scrolling target element in ms.
+                If omitted, run default timeout is used.
+
+        Returns:
+            Dict with mouse-click metadata:
+            - ok (bool): Whether click succeeded.
+            - selector (str): Selector used.
+            - position (str): Position mode used to compute x/y.
+            - x (float): Click x coordinate.
+            - y (float): Click y coordinate.
+            - button (str): Effective button used.
+            - click_count (int): Effective click count.
+            - delay_ms (int): Effective click delay.
+            - url (str): Current page URL after click.
+
+        Examples:
+            await mcp_browser_mouse_click(selector="button[type=submit]")
+            await mcp_browser_mouse_click(selector="#canvas", position="top_left", button="left", click_count=1)
         """
         return await self.mouse_click(
             self._require_run_state(),
