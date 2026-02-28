@@ -43,7 +43,7 @@ class DispatcherAgentNode:
 
         llm = self._create_llm_client(self._dispatcher_cfg, self._build_tools())
         task = self._build_planning_request(state)
-        response = await llm.send_message(message=json.dumps(task, ensure_ascii=False), system_message=self._system_prompt)
+        response = await llm.send_message(message=task, system_message=self._system_prompt)
         parsed = extract_json_obj(str(getattr(response, "content", "") or ""))
         decision = self._normalize_dispatch_plan(parsed)
         return self._apply_plan(state, decision)
@@ -101,13 +101,20 @@ class DispatcherAgentNode:
         updated["dispatcher_mode"] = "final"
         return updated
 
-    def _build_planning_request(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "mode": "dispatch_plan",
-            "target_url": state.get("target_url"),
-            "user_prompt": state.get("user_prompt"),
-            "allowed_agents": ["network_analyst", "runtime_analyst"],
-        }
+    def _build_planning_request(self, state: Dict[str, Any]) -> str:
+        target_url = str(state.get("target_url") or "")
+        user_prompt = str(state.get("user_prompt") or "")
+        return (
+            "Create a dispatch plan for the current browser investigation.\n\n"
+            "# Target URL\n"
+            f"- target_url: {target_url}\n"
+            "# Instructions"
+            f"{user_prompt}\n"
+            "# Allowed Agents\n"
+            "- allowed_agents: [network_analyst, runtime_analyst]\n\n"
+            "# Output Requirement\n"
+            "Return JSON only, matching the dispatcher planning contract in system prompt."
+        )
 
     def _apply_plan(self, state: Dict[str, Any], decision: Dict[str, Any]) -> Dict[str, Any]:
         updated = dict(state)

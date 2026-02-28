@@ -237,11 +237,11 @@ class NetworkInspectorFeature:
     ) -> Dict[str, Any]:
         run_id = str(run_state.run_id)
         entries = list((self._history_by_run.get(run_id) or {}).get("console", []))
-        level_norm = str(level or "").strip().lower()
+        level_values = [v.strip().lower() for v in str(level or "").split(",") if v.strip()]
         text_norm = str(text_contains or "").strip().lower()
         filtered: List[Dict[str, Any]] = []
         for entry in entries:
-            if level_norm and str(entry.get("level") or "").lower() != level_norm:
+            if level_values and str(entry.get("level") or "").lower() not in level_values:
                 continue
             if text_norm and text_norm not in str(entry.get("text") or "").lower():
                 continue
@@ -919,8 +919,8 @@ class NetworkInspectorFeature:
         url_contains: str,
         url_regex: str,
     ) -> List[Dict[str, Any]]:
-        resource_norm = str(resource_type or "").strip().lower()
-        mime_norm = str(mime_type or "").strip().lower()
+        resource_values = [v.strip().lower() for v in str(resource_type or "").split(",") if v.strip()]
+        mime_values = [v.strip().lower() for v in str(mime_type or "").split(",") if v.strip()]
         contains_norm = str(url_contains or "").strip().lower()
         regex_obj = None
         if str(url_regex or "").strip():
@@ -930,10 +930,12 @@ class NetworkInspectorFeature:
                 regex_obj = None
         out: List[Dict[str, Any]] = []
         for item in items:
-            if resource_norm and str(item.get("resource_type") or "").lower() != resource_norm:
+            if resource_values and str(item.get("resource_type") or "").lower() not in resource_values:
                 continue
-            if mime_norm and mime_norm not in str(item.get("mime_type") or "").lower():
-                continue
+            if mime_values:
+                item_mime = str(item.get("mime_type") or "").lower()
+                if not any(mv in item_mime for mv in mime_values):
+                    continue
             status = item.get("status_code")
             if status_min is not None:
                 try:

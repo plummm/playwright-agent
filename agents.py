@@ -200,7 +200,6 @@ class PlaywrightAgent(BaseAgent):
 
         Input must be a direct JSON payload (dict) with required keys:
         - user_prompt
-        - system_prompt
         """
         if not isinstance(input_data, dict):
             raise TypeError("Payload must be a JSON object with direct keys")
@@ -210,13 +209,8 @@ class PlaywrightAgent(BaseAgent):
         if not user_prompt:
             raise ValueError("Missing required field: user_prompt")
 
-        user_system_prompt = str(payload.get("system_prompt") or "").strip()
-        if not user_system_prompt:
-            raise ValueError("Missing required field: system_prompt")
-
         normalized_payload = dict(payload)
         normalized_payload["user_prompt"] = user_prompt
-        normalized_payload["system_prompt"] = user_system_prompt
         base_run_config = self._build_run_config(normalized_payload)
         self._ensure_automation_ready()
 
@@ -242,7 +236,6 @@ class PlaywrightAgent(BaseAgent):
                 url_result = await self._run_dispatcher_workflow(
                     target_url=target_url,
                     user_prompt=user_prompt,
-                    user_system_prompt=user_system_prompt,
                     base_run_config=base_run_config,
                 )
                 result_by_url[target_url] = url_result
@@ -348,7 +341,6 @@ class PlaywrightAgent(BaseAgent):
         *,
         target_url: str,
         user_prompt: str,
-        user_system_prompt: str,
         base_run_config: RunConfig,
     ) -> Dict[str, Any]:
         """Run dispatcher-centered LangGraph workflow for one URL."""
@@ -357,7 +349,7 @@ class PlaywrightAgent(BaseAgent):
             run_id=str(uuid.uuid4()),
             start_url=target_url,
             user_prompt=user_prompt,
-            system_prompt=self._compose_system_prompt(user_system_prompt),
+            system_prompt=self._compose_system_prompt(),
         )
         run_state = await self.session_manager.start(run_config)
         self.run_state = run_state
@@ -383,7 +375,6 @@ class PlaywrightAgent(BaseAgent):
             "target_url": target_url,
             "user_prompt": user_prompt,
             "raw_user_prompt": user_prompt,
-            "user_system_prompt": user_system_prompt,
             "content_mode": "distilled",
             "run_config": run_config,
             "run_state": run_state,
@@ -553,12 +544,15 @@ class PlaywrightAgent(BaseAgent):
             "manifest",
             "other",
         }
-        resource_type = str(raw.get("resource_type") or "").strip().lower()
-        if resource_type in allowed_resource_types:
-            out["resource_type"] = resource_type
-        mime_type = str(raw.get("mime_type") or "").strip().lower()
-        if mime_type:
-            out["mime_type"] = mime_type[:128]
+        rt_raw = str(raw.get("resource_type") or "").strip().lower()
+        rt_parts = [v.strip() for v in rt_raw.split(",") if v.strip()]
+        rt_valid = [v for v in rt_parts if v in allowed_resource_types]
+        if rt_valid:
+            out["resource_type"] = ",".join(rt_valid)
+        mime_raw = str(raw.get("mime_type") or "").strip().lower()
+        mime_parts = [v.strip()[:128] for v in mime_raw.split(",") if v.strip()]
+        if mime_parts:
+            out["mime_type"] = ",".join(mime_parts)
         status_min = PlaywrightAgent._safe_status_int(raw.get("status_min"))
         status_max = PlaywrightAgent._safe_status_int(raw.get("status_max"))
         if status_min is not None:
@@ -581,9 +575,11 @@ class PlaywrightAgent(BaseAgent):
             return {}
         out: Dict[str, Any] = {}
         allowed_levels = {"error", "warning", "warn", "info", "log", "debug", "trace"}
-        level = str(raw.get("level") or "").strip().lower()
-        if level in allowed_levels:
-            out["level"] = level
+        level_raw = str(raw.get("level") or "").strip().lower()
+        level_parts = [v.strip() for v in level_raw.split(",") if v.strip()]
+        level_valid = [v for v in level_parts if v in allowed_levels]
+        if level_valid:
+            out["level"] = ",".join(level_valid)
         text_contains = str(raw.get("text_contains") or "").strip()
         if text_contains:
             out["text_contains"] = text_contains[:256]
@@ -661,21 +657,16 @@ class PlaywrightAgent(BaseAgent):
             "evidence_refs": evidence_refs,
         }
 
-    def _compose_system_prompt(self, user_system_prompt: Optional[str]) -> str:
-        """Merge built-in guardrail prompt with user-provided system prompt."""
-        parts = [self.dispatcher_system_prompt]
-        extra = (user_system_prompt or "").strip()
-        if extra:
-            parts.append(extra)
-        return "\n\n".join(parts)
+    def _compose_system_prompt(self) -> str:
+        """Return the built-in dispatcher system prompt."""
+        return self.dispatcher_system_prompt
 
     def _build_run_config(self, payload: Dict[str, Any]) -> RunConfig:
         """Normalize request payload into immutable run configuration."""
         request_id = str(payload.get("request_id") or uuid.uuid4())
         run_id = request_id
         user_prompt = str(payload.get("user_prompt") or "").strip()
-        user_system_prompt = str(payload.get("system_prompt") or "").strip()
-        merged_system_prompt = self._compose_system_prompt(user_system_prompt or None)
+        merged_system_prompt = self._compose_system_prompt()
 
         return RunConfig(
             run_id=run_id,
