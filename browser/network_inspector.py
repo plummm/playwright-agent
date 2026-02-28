@@ -52,6 +52,7 @@ class NetworkInspectorFeature:
         if self._tools:
             return self._tools
         tools: List[Any] = []
+        disabled_tool_names = {"browser_list_requests", "browser_list_console"}
         for method_name in dir(self):
             method = getattr(self, method_name, None)
             if not callable(method):
@@ -59,6 +60,8 @@ class NetworkInspectorFeature:
             if not bool(getattr(method, "_is_mcp_tool", False)):
                 continue
             tool_name = str(getattr(method, "_mcp_name", method.__name__) or method.__name__)
+            if tool_name in disabled_tool_names:
+                continue
             doc = inspect.getdoc(method) or f"MCP tool: {tool_name}"
             examples = list(getattr(method, "_mcp_examples", []) or [])
             if examples:
@@ -307,6 +310,68 @@ class NetworkInspectorFeature:
             "response_body_size": item.get("response_body_size"),
             "response_body_truncated": bool(item.get("response_body_truncated")),
             "is_download": bool(item.get("is_download")),
+        }
+
+    async def fetch_url_content(
+        self,
+        run_state: RunState,
+        url: str,
+        *,
+        timeout_ms: int = 10000,
+    ) -> Dict[str, Any]:
+        """
+        Deterministically fetch URL content via Playwright context request.
+
+        This helper is intended for agent-internal fallback when captured response
+        body is missing from network logs.
+        """
+        target = str(url or "").strip()
+        if not target:
+            return {"ok": False, "error": "url_required"}
+
+        page = self.session_manager.get_active_page(run_state)
+        if page is None:
+            page = await self.session_manager.new_page(run_state)
+        if page is None:
+            return {"ok": False, "error": "no_active_page"}
+
+        request_ctx = getattr(getattr(page, "context", None), "request", None)
+        if request_ctx is None:
+            return {"ok": False, "error": "request_context_unavailable"}
+
+        try:
+            response = await request_ctx.get(target, timeout=int(timeout_ms))
+        except Exception as e:
+            return {"ok": False, "error": f"fetch_failed:{type(e).__name__}:{e}"}
+
+        try:
+            status_code = int(getattr(response, "status", 0) or 0)
+        except Exception:
+            status_code = 0
+        headers = {}
+        try:
+            headers = dict(await response.all_headers())
+        except Exception:
+            try:
+                headers = dict(getattr(response, "headers", {}) or {})
+            except Exception:
+                headers = {}
+        mime_type = str(headers.get("content-type") or "")
+        try:
+            body_bytes = await response.body()
+        except Exception:
+            body_bytes = b""
+        body_meta = self._serialize_body(body=bytes(body_bytes or b""), mime_type=mime_type)
+        return {
+            "ok": True,
+            "url": target,
+            "status_code": status_code,
+            "headers": headers,
+            "mime_type": mime_type,
+            "body_kind": body_meta.get("kind"),
+            "body": body_meta.get("body"),
+            "body_size": body_meta.get("size"),
+            "body_truncated": body_meta.get("truncated"),
         }
 
     def get_delta_cursor(self, run_state: RunState) -> Dict[str, int]:

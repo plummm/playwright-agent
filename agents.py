@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional
 
 from moose.framework.agent_core.prompt_loader import (
     load_prompt_text,
-    load_system_prompt,
     render_prompt_template,
 )
 from moose.framework import BaseAgent
@@ -23,6 +22,11 @@ from browser.models import RunConfig, RunState
 from browser.network_inspector import NetworkInspectorFeature
 from browser.page_actions import PageActionsFeature
 from browser.session import BrowserSessionManager
+from workflow.dispatcher_agent import DispatcherAgentNode
+from workflow.network_analyst_agent import NetworkAnalystNode
+from workflow.runtime_analyst_agent import RuntimeAnalystNode
+
+from langgraph.graph import StateGraph
 
 
 class PlaywrightAgent(BaseAgent):
@@ -35,19 +39,17 @@ class PlaywrightAgent(BaseAgent):
         """Initialize the agent and feature placeholders."""
         super().__init__(config_path, debug=debug)
         custom = self.config.get("custom", {}) if isinstance(self.config.get("custom"), dict) else {}
-        llm_cfg = custom.get("llm", {}) if isinstance(custom.get("llm"), dict) else {}
         url_cfg = custom.get("url_extractor", {}) if isinstance(custom.get("url_extractor"), dict) else {}
         task_refiner_cfg = custom.get("task_refiner", {}) if isinstance(custom.get("task_refiner"), dict) else {}
-
-        self.agent_system_prompt = (
-            load_system_prompt(
-                system_prompt_path=str(llm_cfg.get("system_prompt_path") or ""),
-                skills_dir=str(llm_cfg.get("skills_dir") or ""),
-                logger=self.logger,
-                label="playwright_agent.custom.llm.system_prompt_path",
-                required=True,
-            )
+        dispatcher_cfg = custom.get("dispatcher", {}) if isinstance(custom.get("dispatcher"), dict) else {}
+        network_analyst_cfg = (
+            custom.get("network_analyst") if isinstance(custom.get("network_analyst"), dict) else {}
         )
+        runtime_analyst_cfg = (
+            custom.get("runtime_analyst") if isinstance(custom.get("runtime_analyst"), dict) else {}
+        )
+        workflow_cfg = custom.get("workflow") if isinstance(custom.get("workflow"), dict) else {}
+
         self.url_extractor_system_prompt = (
             load_prompt_text(
                 path=str(url_cfg.get("system_prompt_path") or ""),
@@ -80,11 +82,55 @@ class PlaywrightAgent(BaseAgent):
                 required=True,
             )
         )
+        self.dispatcher_system_prompt = load_prompt_text(
+            path=str(dispatcher_cfg.get("system_prompt_path") or ""),
+            logger=self.logger,
+            label="playwright_agent.custom.dispatcher.system_prompt_path",
+            required=True,
+        )
+        self.network_analyst_system_prompt = (
+            load_prompt_text(
+                path=str(network_analyst_cfg.get("system_prompt_path") or ""),
+                logger=self.logger,
+                label="playwright_agent.custom.network_analyst.system_prompt_path",
+                required=False,
+            )
+            or (
+                "You are network_analyst. Analyze captured network request/response evidence and return "
+                "strict JSON envelope with concise findings and evidence refs. Avoid raw full-body dumps."
+            )
+        )
+        self.runtime_analyst_system_prompt = (
+            load_prompt_text(
+                path=str(runtime_analyst_cfg.get("system_prompt_path") or ""),
+                logger=self.logger,
+                label="playwright_agent.custom.runtime_analyst.system_prompt_path",
+                required=False,
+            )
+            or (
+                "You are runtime_analyst. Analyze captured console/runtime errors and return strict JSON "
+                "envelope with concise findings and evidence refs."
+            )
+        )
 
         self.url_extractor_llm: Optional[LLMClient] = None
-        self.llm_cfg: Dict[str, Any] = llm_cfg
+        self.dispatcher_llm: Optional[LLMClient] = None
         self.url_extractor_cfg: Dict[str, Any] = url_cfg
         self.task_refiner_cfg: Dict[str, Any] = task_refiner_cfg
+        self.dispatcher_cfg: Dict[str, Any] = dispatcher_cfg
+        self.network_analyst_cfg: Dict[str, Any] = network_analyst_cfg
+        self.runtime_analyst_cfg: Dict[str, Any] = runtime_analyst_cfg
+        self.default_model = str(dispatcher_cfg.get("model") or "gpt-5.2")
+        self.default_temperature = float(dispatcher_cfg.get("temperature", 0.2))
+        self.default_enable_web_search = bool(dispatcher_cfg.get("enable_web_search", False))
+        try:
+            self.max_dispatch_rounds = max(1, int(workflow_cfg.get("max_dispatch_rounds", 3) or 3))
+        except Exception:
+            self.max_dispatch_rounds = 3
+        try:
+            self.max_records_per_subagent = max(1, int(workflow_cfg.get("max_records_per_subagent", 200) or 200))
+        except Exception:
+            self.max_records_per_subagent = 200
         runtime_cfg = custom.get("browser_runtime", {}) if isinstance(custom.get("browser_runtime"), dict) else {}
         downloads_dir = str(runtime_cfg.get("downloads_dir") or "/tmp/playwright_agent")
         activity_db_path = str(runtime_cfg.get("activity_db_path") or "/tmp/playwright_agent/activity.db")
@@ -110,13 +156,42 @@ class PlaywrightAgent(BaseAgent):
             event_logger=self.event_logger,
             base_tmp_dir=downloads_dir,
         )
-        self.browser_automation: Any = BrowserAutomation(
+        self.browser_automation: BrowserAutomation = BrowserAutomation(
             session_manager=self.session_manager,
             page_actions=self.page_actions,
             network_inspector=self.network_inspector,
             downloads=self.downloads,
-            llm_settings=self.llm_cfg,
+            llm_settings={
+                "model": self.default_model,
+                "temperature": self.default_temperature,
+                "enable_web_search": self.default_enable_web_search,
+            },
             logger=self.logger,
+        )
+        self.dispatcher_node_impl = DispatcherAgentNode(
+            create_llm_client=self._create_llm_client,
+            build_tools=self._build_dispatcher_tools,
+            system_prompt=self.dispatcher_system_prompt,
+            dispatcher_cfg=self.dispatcher_cfg,
+            normalize_dispatch_plan=self._normalize_dispatch_plan,
+            resolve_content_mode=self._resolve_content_mode,
+            max_dispatch_rounds=self.max_dispatch_rounds,
+        )
+        self.network_analyst_node_impl = NetworkAnalystNode(
+            network_inspector=self.network_inspector,
+            create_llm_client=self._create_llm_client,
+            build_tools=self._build_network_analyst_tools,
+            role_cfg=self.network_analyst_cfg,
+            system_prompt=self.network_analyst_system_prompt,
+            max_records_per_subagent=self.max_records_per_subagent,
+        )
+        self.runtime_analyst_node_impl = RuntimeAnalystNode(
+            network_inspector=self.network_inspector,
+            create_llm_client=self._create_llm_client,
+            build_tools=self._build_runtime_analyst_tools,
+            role_cfg=self.runtime_analyst_cfg,
+            system_prompt=self.runtime_analyst_system_prompt,
+            max_records_per_subagent=self.max_records_per_subagent,
         )
 
     async def process(self, input_data: Any) -> Dict[str, Any]:
@@ -161,17 +236,14 @@ class PlaywrightAgent(BaseAgent):
                 raise ValueError(str(clarification_question))
             raise ValueError("No actionable URLs identified from user prompt")
 
-        browser_tools = self._build_browser_action_tools()
-        merged_system_prompt = self._compose_system_prompt(user_system_prompt)
         result_by_url: Dict[str, Any] = {}
         for target_url in actionable_urls:
             try:
-                url_result = await self._run_url_workflow(
+                url_result = await self._run_dispatcher_workflow(
                     target_url=target_url,
                     user_prompt=user_prompt,
-                    merged_system_prompt=merged_system_prompt,
+                    user_system_prompt=user_system_prompt,
                     base_run_config=base_run_config,
-                    browser_tools=browser_tools,
                 )
                 result_by_url[target_url] = url_result
             except Exception as url_error:
@@ -215,9 +287,383 @@ class PlaywrightAgent(BaseAgent):
                     tools.extend(feature_tools)
         return tools
 
+    def _build_dispatcher_tools(self) -> List[Any]:
+        """Dispatcher gets page action tools only."""
+        if self.page_actions is None:
+            return []
+        get_tools = getattr(self.page_actions, "get_tools", None)
+        if not callable(get_tools):
+            return []
+        out = get_tools()
+        return out if isinstance(out, list) else []
+
+    def _build_network_analyst_tools(self) -> List[Any]:
+        """Network analyst gets request/resource tools only."""
+        if self.network_inspector is None:
+            return []
+        get_tools = getattr(self.network_inspector, "get_tools", None)
+        if not callable(get_tools):
+            return []
+        names = {"browser_get_resource_source", "browser_list_websocket_frames"}
+        tools: List[Any] = []
+        for tool in (get_tools() or []):
+            name = str(getattr(tool, "name", "") or "")
+            if name in names:
+                tools.append(tool)
+        return tools
+
+    def _build_runtime_analyst_tools(self) -> List[Any]:
+        """Runtime analyst gets console-focused tools only."""
+        if self.network_inspector is None:
+            return []
+        get_tools = getattr(self.network_inspector, "get_tools", None)
+        if not callable(get_tools):
+            return []
+        names = {"browser_list_websocket_frames"}
+        tools: List[Any] = []
+        for tool in (get_tools() or []):
+            name = str(getattr(tool, "name", "") or "")
+            if name in names:
+                tools.append(tool)
+        return tools
+
+    def _create_llm_client(self, role_cfg: Dict[str, Any], tools: Optional[List[Any]] = None) -> LLMClient:
+        """Create role-specific LLM client with optional scoped tools."""
+        model = str(role_cfg.get("model") or self.default_model)
+        temperature = float(role_cfg.get("temperature", self.default_temperature))
+        enable_web_search = bool(role_cfg.get("enable_web_search", self.default_enable_web_search))
+        kwargs = role_cfg.get("kwargs", {})
+        if not isinstance(kwargs, dict):
+            kwargs = {}
+        return LLMClient(
+            model=model,
+            temperature=temperature,
+            enable_web_search=enable_web_search,
+            tools=(tools or []),
+            **kwargs,
+        )
+
+    async def _run_dispatcher_workflow(
+        self,
+        *,
+        target_url: str,
+        user_prompt: str,
+        user_system_prompt: str,
+        base_run_config: RunConfig,
+    ) -> Dict[str, Any]:
+        """Run dispatcher-centered LangGraph workflow for one URL."""
+        run_config = replace(
+            base_run_config,
+            run_id=str(uuid.uuid4()),
+            start_url=target_url,
+            user_prompt=user_prompt,
+            system_prompt=self._compose_system_prompt(user_system_prompt),
+        )
+        run_state = await self.session_manager.start(run_config)
+        self.run_state = run_state
+        if self.event_logger is not None:
+            self.event_logger.start()
+            self.event_logger.init_run(
+                run_id=str(run_state.run_id),
+                request_id=str(run_state.request_id),
+                agent_name=self.name,
+            )
+        if self.network_inspector is not None:
+            self.network_inspector.set_run_state(run_state)
+            await self.network_inspector.attach_listeners(run_state)
+            if run_config.capture_network or run_config.capture_console:
+                await self.network_inspector.start_capture(run_state)
+        if self.page_actions is not None:
+            try:
+                self.page_actions.set_network_inspector(self.network_inspector)
+            except Exception:
+                pass
+
+        state: Dict[str, Any] = {
+            "target_url": target_url,
+            "user_prompt": user_prompt,
+            "raw_user_prompt": user_prompt,
+            "user_system_prompt": user_system_prompt,
+            "content_mode": "distilled",
+            "run_config": run_config,
+            "run_state": run_state,
+            "dispatch_round": 0,
+            "max_dispatch_rounds": self.max_dispatch_rounds,
+            "max_records_per_subagent": self.max_records_per_subagent,
+            "dispatcher_mode": "plan",
+            "dispatch_plan": {},
+            "selected_agents": [],
+            "subagent_tasks": {},
+            "expected_agents": [],
+            "subagent_outputs": {},
+            "merged_subagent_output": {},
+            "final_response": None,
+        }
+
+        try:
+            graph = StateGraph(dict)
+            graph.add_node("task_refiner", self._task_refiner_node)
+            graph.add_node("dispatcher", self._dispatcher_node)
+            graph.add_node("network_analyst", self._network_analyst_node)
+            graph.add_node("runtime_analyst", self._runtime_analyst_node)
+            graph.add_node("merge_subagent_outputs", self._merge_subagent_outputs_node)
+            graph.set_entry_point("task_refiner")
+            graph.add_edge("task_refiner", "dispatcher")
+            graph.add_conditional_edges("dispatcher", self._route_from_dispatcher)
+            graph.add_edge("network_analyst", "merge_subagent_outputs")
+            graph.add_edge("runtime_analyst", "merge_subagent_outputs")
+            graph.add_conditional_edges("merge_subagent_outputs", self._route_from_merge)
+            app = graph.compile()
+            final_state = await app.ainvoke(state)
+            if isinstance(final_state, dict) and final_state.get("final_response") is not None:
+                return final_state["final_response"]
+            return {"status": "error", "error": "workflow_finished_without_final_response"}
+        finally:
+            if self.network_inspector is not None:
+                try:
+                    await self.network_inspector.stop_capture(run_state)
+                except Exception:
+                    pass
+                try:
+                    await self.network_inspector.detach_listeners(run_state)
+                except Exception:
+                    pass
+                self.network_inspector.set_run_state(None)
+            if self.event_logger is not None:
+                try:
+                    self.event_logger.complete_run(run_id=str(run_state.run_id), status="completed")
+                except Exception:
+                    pass
+            try:
+                await self.session_manager.close_context(run_state)
+            except Exception:
+                pass
+            self.run_state = None
+
+    async def _dispatcher_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatcher node delegate."""
+        return await self.dispatcher_node_impl.run(state, extract_json_obj=self._extract_json_obj)
+
+    async def _task_refiner_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Refine user task before dispatcher planning."""
+        raw_user_prompt = str(state.get("raw_user_prompt") or state.get("user_prompt") or "")
+        target_url = str(state.get("target_url") or "").strip()
+        refined_prompt = await self._refine_user_task_for_url(user_prompt=raw_user_prompt, target_url=target_url)
+        updated = dict(state)
+        updated["user_prompt"] = refined_prompt or raw_user_prompt
+        return updated
+
+    async def _dispatcher_finalize_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Compatibility wrapper for finalize path."""
+        updated = dict(state)
+        updated["dispatcher_mode"] = "final"
+        return await self.dispatcher_node_impl.run(updated, extract_json_obj=self._extract_json_obj)
+
+    async def _network_analyst_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Network analyst node delegate."""
+        return await self.network_analyst_node_impl.run(
+            state,
+            normalize_envelope=self._normalize_subagent_envelope,
+            extract_json_obj=self._extract_json_obj,
+        )
+
+    async def _runtime_analyst_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Runtime analyst node delegate."""
+        return await self.runtime_analyst_node_impl.run(
+            state,
+            normalize_envelope=self._normalize_subagent_envelope,
+            extract_json_obj=self._extract_json_obj,
+        )
+
+    async def _merge_subagent_outputs_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Fan-in merge delegate."""
+        return self.dispatcher_node_impl.merge_subagent_outputs(state)
+
+    def _route_from_dispatcher(self, state: Dict[str, Any]) -> Any:
+        """Conditional router delegate for dispatcher fan-out."""
+        return self.dispatcher_node_impl.route_from_dispatcher(state)
+
+    def _route_from_merge(self, state: Dict[str, Any]) -> str:
+        """Route merge output delegate."""
+        return self.dispatcher_node_impl.route_from_merge(state)
+
+    @staticmethod
+    def _normalize_dispatch_plan(parsed: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {"network_analyst", "runtime_analyst"}
+        selected = []
+        for item in (parsed or {}).get("selected_agents", []) or []:
+            name = str(item or "").strip()
+            if name in allowed and name not in selected:
+                selected.append(name)
+        execution_mode = str((parsed or {}).get("execution_mode") or "parallel").strip().lower()
+        if execution_mode not in {"parallel", "single"}:
+            execution_mode = "parallel"
+        content_mode = str((parsed or {}).get("content_mode") or "distilled").strip().lower()
+        if content_mode not in {"distilled", "full_body"}:
+            content_mode = "distilled"
+        tasks = (parsed or {}).get("subagent_tasks", {})
+        if not isinstance(tasks, dict):
+            tasks = {}
+        normalized_tasks: Dict[str, Dict[str, Any]] = {}
+        for agent_name in ("network_analyst", "runtime_analyst"):
+            entry = tasks.get(agent_name)
+            if isinstance(entry, dict):
+                task_text = str(entry.get("task") or "").strip()
+                filter_raw = entry.get("filter")
+            else:
+                task_text = str(entry or "").strip()
+                filter_raw = None
+            if agent_name == "network_analyst":
+                filter_obj = PlaywrightAgent._normalize_network_filters(filter_raw)
+            else:
+                filter_obj = PlaywrightAgent._normalize_runtime_filters(filter_raw)
+            if task_text or filter_obj:
+                normalized_entry: Dict[str, Any] = {}
+                if task_text:
+                    normalized_entry["task"] = task_text
+                if filter_obj:
+                    normalized_entry["filter"] = filter_obj
+                normalized_tasks[agent_name] = normalized_entry
+        return {
+            "finish": bool((parsed or {}).get("finish", False)),
+            "final_response": str((parsed or {}).get("final_response") or "").strip(),
+            "selected_agents": selected,
+            "execution_mode": execution_mode,
+            "content_mode": content_mode,
+            "subagent_tasks": normalized_tasks,
+        }
+
+    @staticmethod
+    def _normalize_network_filters(raw: Any) -> Dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        allowed_resource_types = {
+            "document",
+            "stylesheet",
+            "image",
+            "media",
+            "font",
+            "script",
+            "texttrack",
+            "xhr",
+            "fetch",
+            "eventsource",
+            "websocket",
+            "manifest",
+            "other",
+        }
+        resource_type = str(raw.get("resource_type") or "").strip().lower()
+        if resource_type in allowed_resource_types:
+            out["resource_type"] = resource_type
+        mime_type = str(raw.get("mime_type") or "").strip().lower()
+        if mime_type:
+            out["mime_type"] = mime_type[:128]
+        status_min = PlaywrightAgent._safe_status_int(raw.get("status_min"))
+        status_max = PlaywrightAgent._safe_status_int(raw.get("status_max"))
+        if status_min is not None:
+            out["status_min"] = status_min
+        if status_max is not None:
+            out["status_max"] = status_max
+        if status_min is not None and status_max is not None and status_min > status_max:
+            out["status_min"], out["status_max"] = out["status_max"], out["status_min"]
+        url_contains = str(raw.get("url_contains") or "").strip()
+        if url_contains:
+            out["url_contains"] = url_contains[:256]
+        url_regex = str(raw.get("url_regex") or "").strip()
+        if url_regex:
+            out["url_regex"] = url_regex[:256]
+        return out
+
+    @staticmethod
+    def _normalize_runtime_filters(raw: Any) -> Dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        allowed_levels = {"error", "warning", "warn", "info", "log", "debug", "trace"}
+        level = str(raw.get("level") or "").strip().lower()
+        if level in allowed_levels:
+            out["level"] = level
+        text_contains = str(raw.get("text_contains") or "").strip()
+        if text_contains:
+            out["text_contains"] = text_contains[:256]
+        return out
+
+    @staticmethod
+    def _safe_status_int(value: Any) -> Optional[int]:
+        try:
+            iv = int(value)
+        except Exception:
+            return None
+        if iv < 100 or iv > 599:
+            return None
+        return iv
+
+    @staticmethod
+    def _resolve_content_mode(requested_mode: str, user_prompt: str, task_map: Dict[str, Any]) -> str:
+        """Dispatcher-owned content mode resolution with security-aware override."""
+        mode = str(requested_mode or "").strip().lower()
+        if mode not in {"distilled", "full_body"}:
+            mode = "distilled"
+        network_task = ""
+        runtime_task = ""
+        if isinstance(task_map, dict):
+            net_entry = task_map.get("network_analyst")
+            rt_entry = task_map.get("runtime_analyst")
+            network_task = (
+                str((net_entry or {}).get("task") or "")
+                if isinstance(net_entry, dict)
+                else str(net_entry or "")
+            )
+            runtime_task = (
+                str((rt_entry or {}).get("task") or "")
+                if isinstance(rt_entry, dict)
+                else str(rt_entry or "")
+            )
+        combined_text = " ".join(
+            [
+                str(user_prompt or ""),
+                network_task,
+                runtime_task,
+            ]
+        ).lower()
+        security_markers = (
+            "security",
+            "vulnerability",
+            "threat",
+            "xss",
+            "sqli",
+            "csrf",
+            "injection",
+            "exploit",
+            "audit",
+            "pentest",
+        )
+        if any(marker in combined_text for marker in security_markers):
+            return "full_body"
+        return mode
+
+    @staticmethod
+    def _normalize_subagent_envelope(agent: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
+        base = parsed if isinstance(parsed, dict) else {}
+        findings = base.get("findings", [])
+        if not isinstance(findings, list):
+            findings = [str(findings)]
+        evidence_refs = base.get("evidence_refs", [])
+        if not isinstance(evidence_refs, list):
+            evidence_refs = [str(evidence_refs)]
+        return {
+            "agent": agent,
+            "task_id": str(base.get("task_id") or f"{agent}-task"),
+            "status": str(base.get("status") or "ok"),
+            "summary": str(base.get("summary") or ""),
+            "findings": findings,
+            "evidence_refs": evidence_refs,
+        }
+
     def _compose_system_prompt(self, user_system_prompt: Optional[str]) -> str:
         """Merge built-in guardrail prompt with user-provided system prompt."""
-        parts = [self.agent_system_prompt]
+        parts = [self.dispatcher_system_prompt]
         extra = (user_system_prompt or "").strip()
         if extra:
             parts.append(extra)
@@ -261,10 +707,9 @@ class PlaywrightAgent(BaseAgent):
         if self.url_extractor_llm is not None:
             return self.url_extractor_llm
 
-        llm_cfg = self.llm_cfg
         extractor_cfg = self.url_extractor_cfg
 
-        model = str(extractor_cfg.get("model") or llm_cfg.get("model") or "gpt-4o-mini")
+        model = str(extractor_cfg.get("model") or self.default_model)
         temperature = float(extractor_cfg.get("temperature", 0.0))
         enable_web_search = bool(extractor_cfg.get("enable_web_search", False))
 
@@ -294,67 +739,6 @@ class PlaywrightAgent(BaseAgent):
         parsed = self._extract_json_obj(str(getattr(response, "content", "") or ""))
         return self._normalize_url_extractor_payload(parsed)
 
-    async def _run_url_workflow(
-        self,
-        *,
-        target_url: str,
-        user_prompt: str,
-        merged_system_prompt: str,
-        base_run_config: RunConfig,
-        browser_tools: List[Any],
-    ) -> Dict[str, Any]:
-        """Run URL workflow graph: task refinement node then browser automation node."""
-
-        async def _identify_user_task(state: Dict[str, Any]) -> Dict[str, Any]:
-            refined_prompt = await self._refine_user_task_for_url(
-                user_prompt=state["user_prompt"],
-                target_url=state["target_url"],
-            )
-            return {**state, "refined_user_prompt": refined_prompt}
-
-        async def _browser_automation_node(state: Dict[str, Any]) -> Dict[str, Any]:
-            worker_system_prompt = self._compose_browser_worker_system_prompt(
-                base_system_prompt=merged_system_prompt,
-                browser_tools=browser_tools,
-                target_url=state["target_url"],
-            )
-            browser_result = await self._invoke_browser_automation_for_url(
-                target_url=state["target_url"],
-                refined_user_prompt=state.get("refined_user_prompt") or state["user_prompt"],
-                worker_system_prompt=worker_system_prompt,
-                base_run_config=base_run_config,
-                browser_tools=browser_tools,
-            )
-            return {**state, "browser_result": browser_result}
-
-        initial_state = {
-            "target_url": target_url,
-            "user_prompt": user_prompt,
-            "refined_user_prompt": "",
-            "browser_result": {},
-        }
-
-        try:
-            from langgraph.graph import END, StateGraph
-        except Exception:
-            first = await _identify_user_task(initial_state)
-            second_input = dict(initial_state)
-            second_input.update(first)
-            second = await _browser_automation_node(second_input)
-            return second.get("browser_result", {})
-
-        graph = StateGraph(dict)
-        graph.add_node("identify_user_task", _identify_user_task)
-        graph.add_node("browser_automation", _browser_automation_node)
-        graph.set_entry_point("identify_user_task")
-        graph.add_edge("identify_user_task", "browser_automation")
-        graph.add_edge("browser_automation", END)
-        app = graph.compile()
-        output = await app.ainvoke(initial_state)
-        if isinstance(output, dict):
-            return output.get("browser_result", {}) if isinstance(output.get("browser_result"), dict) else output
-        return {"output": output}
-
     async def _refine_user_task_for_url(self, *, user_prompt: str, target_url: str) -> str:
         """Use a dedicated LLM call to extract a URL-specific browser objective."""
         llm = self._create_task_refiner_llm_client()
@@ -372,10 +756,9 @@ class PlaywrightAgent(BaseAgent):
 
     def _create_task_refiner_llm_client(self) -> LLMClient:
         """Create a fresh LLM client for the task-refinement node."""
-        llm_cfg = self.llm_cfg
         refiner_cfg = self.task_refiner_cfg
 
-        model = str(refiner_cfg.get("model") or llm_cfg.get("model") or "gpt-4o-mini")
+        model = str(refiner_cfg.get("model") or self.default_model)
         temperature = float(refiner_cfg.get("temperature", 0.1))
         enable_web_search = bool(refiner_cfg.get("enable_web_search", False))
         kwargs = refiner_cfg.get("kwargs", {})
@@ -387,61 +770,6 @@ class PlaywrightAgent(BaseAgent):
             enable_web_search=enable_web_search,
             **kwargs,
         )
-
-    async def _invoke_browser_automation_for_url(
-        self,
-        *,
-        target_url: str,
-        refined_user_prompt: str,
-        worker_system_prompt: str,
-        base_run_config: RunConfig,
-        browser_tools: List[Any],
-    ) -> Dict[str, Any]:
-        """Invoke browser automation implementation for one URL."""
-        run_method = getattr(self.browser_automation, "run", None)
-        if not callable(run_method):
-            raise NotImplementedError("Browser automation class must implement a `run` method")
-
-        per_url_run_config = replace(
-            base_run_config,
-            run_id=str(uuid.uuid4()),
-            start_url=target_url,
-            user_prompt=refined_user_prompt,
-            system_prompt=worker_system_prompt,
-        )
-        out = await run_method(run_config=per_url_run_config, tools=browser_tools)
-        return out if isinstance(out, dict) else {"output": out}
-
-    def _compose_browser_worker_system_prompt(
-        self,
-        *,
-        base_system_prompt: str,
-        browser_tools: List[Any],
-        target_url: str,
-    ) -> str:
-        """Compose per-URL worker system prompt with explicit browser tool capabilities."""
-        capabilities: List[str] = []
-        for tool in browser_tools:
-            name = str(getattr(tool, "name", "") or "").strip() or tool.__class__.__name__
-            desc = str(getattr(tool, "description", "") or "").strip()
-            if desc:
-                capabilities.append(f"- {name}: {desc}")
-            else:
-                capabilities.append(f"- {name}")
-        capabilities_text = "\n".join(capabilities) if capabilities else "- No browser tools registered"
-
-        worker_prompt = (
-            "You are executing browser automation for one target URL.\n"
-            f"Target URL: {target_url}\n\n"
-            "Capabilities available as MCP tools:\n"
-            f"{capabilities_text}\n\n"
-            "Execution policy:\n"
-            "1. Use the available browser tools to complete the objective.\n"
-            "2. Prefer deterministic sequences (navigate, inspect, interact, verify).\n"
-            "3. Keep actions scoped to the target URL task.\n"
-            "4. Ground conclusions in tool-observed evidence.\n"
-        )
-        return f"{base_system_prompt}\n\n{worker_prompt}"
 
     def _normalize_url_extractor_payload(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize URL extractor payload into the expected schema."""
