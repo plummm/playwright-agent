@@ -48,7 +48,6 @@ class NetworkAnalystNode:
         )
         per_request_results = await self._analyze_each_record(
             task=task,
-            target_url=state.get("target_url"),
             prepared_records=prepared_records,
             extract_json_obj=extract_json_obj,
         )
@@ -118,21 +117,21 @@ class NetworkAnalystNode:
         self,
         *,
         task: str,
-        target_url: Any,
         prepared_records: List[Dict[str, Any]],
         extract_json_obj: Callable[[str], Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         llm = self._create_llm_client(self._role_cfg, self._build_tools())
         per_request_results: List[Dict[str, Any]] = []
         for row in prepared_records:
-            prompt = self._build_record_prompt(task=task, target_url=target_url, row=row)
+            prompt = self._build_record_prompt(task=task, row=row)
             parsed_item = await self._call_record_llm(llm=llm, prompt=prompt, extract_json_obj=extract_json_obj)
             per_request_results.append(self._normalize_record_result(parsed_item=parsed_item, row=row))
         return per_request_results
 
     @staticmethod
-    def _build_record_prompt(*, task: str, target_url: Any, row: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_record_prompt(*, task: str, row: Dict[str, Any]) -> Dict[str, Any]:
         flat_record = {
+            "url": row.get("url"),
             "method": row.get("method"),
             "resource_type": row.get("resource_type"),
             "post_data": row.get("post_data"),
@@ -144,7 +143,6 @@ class NetworkAnalystNode:
         }
         return {
             "task": task,
-            "target_url": target_url,
             "record": flat_record,
         }
 
