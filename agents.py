@@ -6,7 +6,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from moose.framework.agent_core.prompt_loader import (
     load_prompt_text,
@@ -27,6 +27,60 @@ from workflow.network_analyst_agent import NetworkAnalystNode
 from workflow.runtime_analyst_agent import RuntimeAnalystNode
 
 from langgraph.graph import StateGraph
+
+
+def _merge_subagent_outputs(
+    left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(left or {})
+    merged.update(dict(right or {}))
+    return merged
+
+
+def _sum_llm_metrics(
+    left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    base = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "total_cost": 0.0}
+    out = dict(base)
+    for src in (left or {}, right or {}):
+        try:
+            out["input_tokens"] += int(src.get("input_tokens", 0) or 0)
+        except Exception:
+            pass
+        try:
+            out["output_tokens"] += int(src.get("output_tokens", 0) or 0)
+        except Exception:
+            pass
+        try:
+            out["total_tokens"] += int(src.get("total_tokens", 0) or 0)
+        except Exception:
+            pass
+        try:
+            out["total_cost"] += float(src.get("total_cost", 0.0) or 0.0)
+        except Exception:
+            pass
+    return out
+
+
+class WorkflowState(TypedDict, total=False):
+    target_url: str
+    user_prompt: str
+    raw_user_prompt: str
+    content_mode: str
+    run_config: Any
+    run_state: Any
+    dispatch_round: int
+    max_dispatch_rounds: int
+    max_records_per_subagent: int
+    dispatcher_mode: str
+    dispatch_plan: Dict[str, Any]
+    selected_agents: List[str]
+    subagent_tasks: Dict[str, Any]
+    expected_agents: List[str]
+    subagent_outputs: Annotated[Dict[str, Any], _merge_subagent_outputs]
+    llm_metrics: Annotated[Dict[str, Any], _sum_llm_metrics]
+    merged_subagent_output: Dict[str, Any]
+    final_response: Any
 
 
 class PlaywrightAgent(BaseAgent):
@@ -371,7 +425,7 @@ class PlaywrightAgent(BaseAgent):
             except Exception:
                 pass
 
-        state: Dict[str, Any] = {
+        state: WorkflowState = {
             "target_url": target_url,
             "user_prompt": user_prompt,
             "raw_user_prompt": user_prompt,
@@ -387,12 +441,13 @@ class PlaywrightAgent(BaseAgent):
             "subagent_tasks": {},
             "expected_agents": [],
             "subagent_outputs": {},
+            "llm_metrics": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "total_cost": 0.0},
             "merged_subagent_output": {},
             "final_response": None,
         }
 
         try:
-            graph = StateGraph(dict)
+            graph = StateGraph(WorkflowState)
             graph.add_node("task_refiner", self._task_refiner_node)
             graph.add_node("dispatcher", self._dispatcher_node)
             graph.add_node("network_analyst", self._network_analyst_node)
@@ -439,9 +494,12 @@ class PlaywrightAgent(BaseAgent):
         """Refine user task before dispatcher planning."""
         raw_user_prompt = str(state.get("raw_user_prompt") or state.get("user_prompt") or "")
         target_url = str(state.get("target_url") or "").strip()
-        refined_prompt = await self._refine_user_task_for_url(user_prompt=raw_user_prompt, target_url=target_url)
+        refined_prompt, llm_metrics = await self._refine_user_task_for_url(
+            user_prompt=raw_user_prompt, target_url=target_url
+        )
         updated = dict(state)
         updated["user_prompt"] = refined_prompt or raw_user_prompt
+        updated["llm_metrics"] = _sum_llm_metrics(state.get("llm_metrics"), llm_metrics)
         return updated
 
     async def _dispatcher_finalize_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -642,19 +700,15 @@ class PlaywrightAgent(BaseAgent):
     @staticmethod
     def _normalize_subagent_envelope(agent: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
         base = parsed if isinstance(parsed, dict) else {}
-        findings = base.get("findings", [])
-        if not isinstance(findings, list):
-            findings = [str(findings)]
-        evidence_refs = base.get("evidence_refs", [])
-        if not isinstance(evidence_refs, list):
-            evidence_refs = [str(evidence_refs)]
+        finding_evidence_pairs = base.get("finding_evidence_pairs", [])
+        if not isinstance(finding_evidence_pairs, list):
+            finding_evidence_pairs = []
         return {
             "agent": agent,
             "task_id": str(base.get("task_id") or f"{agent}-task"),
             "status": str(base.get("status") or "ok"),
             "summary": str(base.get("summary") or ""),
-            "findings": findings,
-            "evidence_refs": evidence_refs,
+            "finding_evidence_pairs": finding_evidence_pairs,
         }
 
     def _compose_system_prompt(self) -> str:
@@ -730,7 +784,7 @@ class PlaywrightAgent(BaseAgent):
         parsed = self._extract_json_obj(str(getattr(response, "content", "") or ""))
         return self._normalize_url_extractor_payload(parsed)
 
-    async def _refine_user_task_for_url(self, *, user_prompt: str, target_url: str) -> str:
+    async def _refine_user_task_for_url(self, *, user_prompt: str, target_url: str) -> tuple[str, Dict[str, Any]]:
         """Use a dedicated LLM call to extract a URL-specific browser objective."""
         llm = self._create_task_refiner_llm_client()
         system_message = str(self.task_refiner_system_prompt or "").strip()
@@ -743,7 +797,14 @@ class PlaywrightAgent(BaseAgent):
         )
         response = await llm.send_message(message=user_message, system_message=system_message)
         objective = str(response.content or "").strip()
-        return objective or user_prompt
+        usage = getattr(response, "usage", {}) or {}
+        metrics = {
+            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+            "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            "total_cost": float(getattr(response, "cost", 0.0) or 0.0),
+        }
+        return objective or user_prompt, metrics
 
     def _create_task_refiner_llm_client(self) -> LLMClient:
         """Create a fresh LLM client for the task-refinement node."""

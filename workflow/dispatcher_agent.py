@@ -44,9 +44,13 @@ class DispatcherAgentNode:
         llm = self._create_llm_client(self._dispatcher_cfg, self._build_tools())
         task = self._build_planning_request(state)
         response = await llm.send_message(message=task, system_message=self._system_prompt)
+        state_with_metrics = dict(state)
+        state_with_metrics["llm_metrics"] = self._merge_llm_metrics(
+            state.get("llm_metrics"), self._response_llm_metrics(response)
+        )
         parsed = extract_json_obj(str(getattr(response, "content", "") or ""))
         decision = self._normalize_dispatch_plan(parsed)
-        return self._apply_plan(state, decision)
+        return self._apply_plan(state_with_metrics, decision)
 
     async def _finalize(self, state: Dict[str, Any]) -> Dict[str, Any]:
         llm = self._create_llm_client(self._dispatcher_cfg, [])
@@ -60,13 +64,18 @@ class DispatcherAgentNode:
         }
         response = await llm.send_message(message=json.dumps(payload, ensure_ascii=False), system_message=self._system_prompt)
         content = str(getattr(response, "content", "") or "").strip()
+        llm_metrics = self._merge_llm_metrics(
+            state.get("llm_metrics"), self._response_llm_metrics(response)
+        )
         updated = dict(state)
+        updated["llm_metrics"] = llm_metrics
         updated["final_response"] = {
             "status": "success",
             "dispatcher_response": content,
             "target_url": state.get("target_url"),
             "dispatch_round": state.get("dispatch_round"),
             "subagent_outputs": state.get("subagent_outputs", {}),
+            "llm_metrics": llm_metrics,
         }
         return updated
 
@@ -127,6 +136,7 @@ class DispatcherAgentNode:
                 "target_url": state.get("target_url"),
                 "dispatch_round": updated["dispatch_round"],
                 "subagent_outputs": state.get("subagent_outputs", {}),
+                "llm_metrics": state.get("llm_metrics", {}),
             }
             return updated
 
@@ -143,3 +153,35 @@ class DispatcherAgentNode:
         if not selected_agents:
             updated["dispatcher_mode"] = "final"
         return updated
+
+    @staticmethod
+    def _response_llm_metrics(response: Any) -> Dict[str, Any]:
+        usage = getattr(response, "usage", {}) or {}
+        return {
+            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+            "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            "total_cost": float(getattr(response, "cost", 0.0) or 0.0),
+        }
+
+    @staticmethod
+    def _merge_llm_metrics(left: Any, right: Any) -> Dict[str, Any]:
+        out = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "total_cost": 0.0}
+        for src in (left or {}, right or {}):
+            try:
+                out["input_tokens"] += int(src.get("input_tokens", 0) or 0)
+            except Exception:
+                pass
+            try:
+                out["output_tokens"] += int(src.get("output_tokens", 0) or 0)
+            except Exception:
+                pass
+            try:
+                out["total_tokens"] += int(src.get("total_tokens", 0) or 0)
+            except Exception:
+                pass
+            try:
+                out["total_cost"] += float(src.get("total_cost", 0.0) or 0.0)
+            except Exception:
+                pass
+        return out
