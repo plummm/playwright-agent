@@ -345,18 +345,30 @@ class PlaywrightAgent(BaseAgent):
         return out if isinstance(out, list) else []
 
     def _build_network_analyst_tools(self) -> List[Any]:
-        """Network analyst gets request/resource tools only."""
-        if self.network_inspector is None:
-            return []
-        get_tools = getattr(self.network_inspector, "get_tools", None)
-        if not callable(get_tools):
-            return []
-        names = {"browser_get_resource_source", "browser_list_websocket_frames"}
+        """Network analyst gets request/resource + page action tools."""
         tools: List[Any] = []
-        for tool in (get_tools() or []):
-            name = str(getattr(tool, "name", "") or "")
-            if name in names:
-                tools.append(tool)
+        seen: set[str] = set()
+
+        # Network inspector scoped tools.
+        if self.network_inspector is not None:
+            get_net_tools = getattr(self.network_inspector, "get_tools", None)
+            if callable(get_net_tools):
+                names = {"browser_get_resource_source", "browser_list_websocket_frames"}
+                for tool in (get_net_tools() or []):
+                    name = str(getattr(tool, "name", "") or "")
+                    if name in names and name not in seen:
+                        tools.append(tool)
+                        seen.add(name)
+
+        # Add page action tools so analyst can navigate/screenshot HTML targets when needed.
+        if self.page_actions is not None:
+            get_page_tools = getattr(self.page_actions, "get_tools", None)
+            if callable(get_page_tools):
+                for tool in (get_page_tools() or []):
+                    name = str(getattr(tool, "name", "") or "")
+                    if name and name not in seen:
+                        tools.append(tool)
+                        seen.add(name)
         return tools
 
     def _build_runtime_analyst_tools(self) -> List[Any]:

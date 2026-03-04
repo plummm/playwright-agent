@@ -52,7 +52,12 @@ class NetworkAnalystNode:
         else:
             task = str(task_entry or state.get("user_prompt") or "")
             filters = {}
-        records = await self._load_records(run_state=run_state, max_records=max_records, filters=filters)
+        records = await self._load_records(
+            run_state=run_state,
+            max_records=max_records,
+            filters=filters,
+            target_url=str(state.get("target_url") or "").strip(),
+        )
         prepared_records = await self._prepare_records(
             run_state=run_state,
             records=records,
@@ -74,7 +79,14 @@ class NetworkAnalystNode:
             "llm_metrics": llm_metrics or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "total_cost": 0.0},
         }
 
-    async def _load_records(self, *, run_state: Any, max_records: int, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def _load_records(
+        self,
+        *,
+        run_state: Any,
+        max_records: int,
+        filters: Dict[str, Any],
+        target_url: str = "",
+    ) -> List[Dict[str, Any]]:
         records_page = {"items": []}
         if self._network_inspector is not None and run_state is not None:
             try:
@@ -91,7 +103,28 @@ class NetworkAnalystNode:
                 )
             except Exception:
                 pass
-        return list(records_page.get("items") or [])
+        records = list(records_page.get("items") or [])
+
+        # Always include the top-level target URL as an analyzable record when missing.
+        tu = str(target_url or "").strip()
+        if tu and not any(str(item.get("url") or "").strip() == tu for item in records):
+            target_row = {
+                "request_id": "target_url_seed",
+                "url": tu,
+                "method": "GET",
+                "resource_type": "document",
+                "post_data": None,
+                "response_body": None,
+                "response_body_truncated": False,
+                "error_text": None,
+                "is_download": False,
+                "download_reason": None,
+            }
+            records.insert(0, target_row)
+
+        if len(records) > max_records:
+            records = records[:max_records]
+        return records
 
     async def _prepare_records(self, *, run_state: Any, records: List[Dict[str, Any]], content_mode: str) -> List[Dict[str, Any]]:
         if not records:
