@@ -14,8 +14,8 @@ from langchain_core.tools import StructuredTool
 
 from .event_logger import BrowserEventLogger
 from .models import RunState
-from .page_actions import mcp_tool
 from .session import BrowserSessionManager
+from .tooling import mcp_tool
 
 
 class NetworkInspectorFeature:
@@ -52,7 +52,7 @@ class NetworkInspectorFeature:
         if self._tools:
             return self._tools
         tools: List[Any] = []
-        disabled_tool_names = {"browser_list_requests", "browser_list_console"}
+        disabled_tool_names: set[str] = set()
         for method_name in dir(self):
             method = getattr(self, method_name, None)
             if not callable(method):
@@ -76,18 +76,15 @@ class NetworkInspectorFeature:
         self._tools = tools
         return self._tools
 
-    async def attach_listeners(self, run_state: RunState) -> None:
+    def _attach_page_listeners(self, run_state: RunState, page: Any) -> None:
         run_id = str(run_state.run_id)
-        if self._attached_by_run.get(run_id):
+        handlers_state = self._handlers_by_run.setdefault(run_id, {"pages": {}, "context_page": None})
+        page_handlers = handlers_state.setdefault("pages", {})
+        page_key = str(id(page))
+        if page_key in page_handlers:
             return
-        page = self.session_manager.get_active_page(run_state)
-        if page is None:
-            page = await self.session_manager.new_page(run_state)
-        if page is None:
-            raise RuntimeError("No active browser page for listener attachment")
 
-        self._ensure_run_storage(run_state)
-        self._tasks_by_run.setdefault(run_id, set())
+        self.session_manager.sync_pages(run_state, preferred_page=page)
 
         def _on_request(request: Any) -> None:
             self._spawn(run_id, self._handle_request(run_state, request))
@@ -118,7 +115,7 @@ class NetworkInspectorFeature:
         page.on("websocket", _on_websocket)
         page.on("download", _on_download)
 
-        self._handlers_by_run[run_id] = {
+        page_handlers[page_key] = {
             "page": page,
             "request": _on_request,
             "response": _on_response,
@@ -128,13 +125,42 @@ class NetworkInspectorFeature:
             "websocket": _on_websocket,
             "download": _on_download,
         }
+
+    async def attach_listeners(self, run_state: RunState) -> None:
+        run_id = str(run_state.run_id)
+        if self._attached_by_run.get(run_id):
+            return
+        context = getattr(run_state, "browser_context", None)
+        if context is None:
+            raise RuntimeError("No browser context for listener attachment")
+
+        self._ensure_run_storage(run_state)
+        self._tasks_by_run.setdefault(run_id, set())
+        handlers_state = self._handlers_by_run.setdefault(run_id, {"pages": {}, "context_page": None})
+        for page in list(getattr(context, "pages", []) or []):
+            self._attach_page_listeners(run_state, page)
+        if handlers_state.get("context_page") is None:
+            def _on_page(page: Any) -> None:
+                self._attach_page_listeners(run_state, page)
+
+            context.on("page", _on_page)
+            handlers_state["context_page"] = _on_page
         self._attached_by_run[run_id] = True
 
     async def detach_listeners(self, run_state: RunState) -> None:
         run_id = str(run_state.run_id)
         ctx = self._handlers_by_run.get(run_id) or {}
-        page = ctx.get("page")
-        if page is not None:
+        context = getattr(run_state, "browser_context", None)
+        context_page_handler = ctx.get("context_page")
+        if context is not None and context_page_handler is not None:
+            try:
+                context.remove_listener("page", context_page_handler)
+            except Exception:
+                pass
+        for page_ctx in (ctx.get("pages") or {}).values():
+            page = page_ctx.get("page")
+            if page is None:
+                continue
             for evt in (
                 "request",
                 "response",
@@ -144,7 +170,7 @@ class NetworkInspectorFeature:
                 "websocket",
                 "download",
             ):
-                handler = ctx.get(evt)
+                handler = page_ctx.get(evt)
                 if handler is None:
                     continue
                 try:
@@ -200,6 +226,112 @@ class NetworkInspectorFeature:
                 "websocket": len(history.get("websocket", [])),
                 "errors": len(history.get("errors", [])),
             },
+        }
+
+    def _truncate_text(self, value: Any, limit: int = 240) -> str:
+        text = str(value or "")
+        return text if len(text) <= limit else text[:limit] + "..."
+
+    def _summarize_request_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "request_id": entry.get("request_id"),
+            "event_type": entry.get("event_type"),
+            "method": entry.get("method"),
+            "url": entry.get("url"),
+            "resource_type": entry.get("resource_type"),
+            "status_code": entry.get("status_code"),
+            "mime_type": entry.get("mime_type"),
+            "is_download": bool(entry.get("is_download")),
+            "download_reason": entry.get("download_reason"),
+            "error_text": self._truncate_text(entry.get("error_text"), 240) if entry.get("error_text") else None,
+        }
+
+    def _summarize_console_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "level": entry.get("level"),
+            "text": self._truncate_text(entry.get("text"), 240),
+            "page_url": entry.get("page_url"),
+        }
+
+    def _summarize_websocket_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        summarized = {
+            "event_type": entry.get("event_type"),
+            "websocket_id": entry.get("websocket_id"),
+            "url": entry.get("url"),
+        }
+        text_payload = entry.get("payload_text")
+        if text_payload:
+            summarized["payload_text"] = self._truncate_text(text_payload, 240)
+        elif entry.get("payload_base64"):
+            summarized["payload_base64"] = "<omitted>"
+        return summarized
+
+    async def summarize_capture(
+        self,
+        run_state: RunState,
+        *,
+        request_limit: int = 15,
+        failed_request_limit: int = 10,
+        console_limit: int = 10,
+        websocket_limit: int = 10,
+    ) -> Dict[str, Any]:
+        run_id = str(run_state.run_id)
+        history = self._history_by_run.get(run_id) or {}
+        requests = list(history.get("requests", []))
+        console = list(history.get("console", []))
+        websocket = list(history.get("websocket", []))
+        page_errors = list(history.get("errors", []))
+
+        failed_requests: List[Dict[str, Any]] = []
+        for item in requests:
+            event_type = str(item.get("event_type") or "")
+            status_code = item.get("status_code")
+            has_http_error = False
+            try:
+                has_http_error = status_code is not None and int(status_code) >= 400
+            except Exception:
+                has_http_error = False
+            if event_type == "request_failed" or bool(item.get("error_text")) or has_http_error:
+                failed_requests.append(item)
+
+        console_errors = [
+            item
+            for item in console
+            if str(item.get("level") or "").lower() in {"error", "pageerror"}
+        ]
+
+        safe_request_limit = max(1, int(request_limit or 15))
+        safe_failed_limit = max(1, int(failed_request_limit or 10))
+        safe_console_limit = max(1, int(console_limit or 10))
+        safe_ws_limit = max(1, int(websocket_limit or 10))
+
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "counts": {
+                "requests": len(requests),
+                "failed_requests": len(failed_requests),
+                "console": len(console),
+                "console_errors": len(console_errors),
+                "websocket": len(websocket),
+                "page_errors": len(page_errors),
+            },
+            "recent_requests": [
+                self._summarize_request_entry(item)
+                for item in reversed(requests[-safe_request_limit:])
+            ],
+            "failed_requests": [
+                self._summarize_request_entry(item)
+                for item in reversed(failed_requests[-safe_failed_limit:])
+            ],
+            "console_errors": [
+                self._summarize_console_entry(item)
+                for item in reversed(console_errors[-safe_console_limit:])
+            ],
+            "recent_websocket": [
+                self._summarize_websocket_entry(item)
+                for item in reversed(websocket[-safe_ws_limit:])
+            ],
         }
 
     async def list_requests(

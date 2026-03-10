@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional
 
 
@@ -22,6 +22,55 @@ class RunConfig:
     capture_console: bool = True
     capture_response_bodies: bool = True
     accept_downloads: bool = True
+    ignore_https_errors: bool = False
+
+
+@dataclass
+class SemanticRef:
+    """Resolved semantic browser reference used by tool actions."""
+
+    ref: str
+    page_id: str
+    description: str
+    role: str = ""
+    name: str = ""
+    tag_name: str = ""
+    text: str = ""
+    node_id: Optional[int] = None
+    backend_node_id: Optional[int] = None
+    object_id: Optional[str] = None
+    href: Optional[str] = None
+    value: Optional[str] = None
+    placeholder: Optional[str] = None
+    input_type: Optional[str] = None
+    disabled: bool = False
+    checked: Optional[bool] = None
+    selected: Optional[bool] = None
+    expanded: Optional[bool] = None
+    bbox: Dict[str, float] = field(default_factory=dict)
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class SemanticSnapshot:
+    """Text-first semantic snapshot of the active page."""
+
+    snapshot_id: str
+    page_id: str
+    url: str
+    title: str
+    created_at: float
+    rendered: str
+    refs: Dict[str, SemanticRef] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["refs"] = {name: ref.to_dict() for name, ref in self.refs.items()}
+        return data
 
 
 @dataclass
@@ -34,9 +83,11 @@ class RunState:
     started_at: Optional[float] = None
     ended_at: Optional[float] = None
     current_url: Optional[str] = None
+    active_page_id: Optional[str] = None
     playwright: Any = None
     browser_context: Any = None
     page: Any = None
+    snapshot: Optional[SemanticSnapshot] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 

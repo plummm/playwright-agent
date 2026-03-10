@@ -1,15 +1,18 @@
 """Browser runtime package for PlaywrightAgent."""
 
-from .automation import BrowserAutomation
+from .controller import BrowserController
 from .downloads import DownloadsFeature
 from .event_logger import BrowserEventLogger
-from .models import ConsoleEvent, NetworkEvent, RunConfig, RunState
+from .loop_runtime import BrowserAutomation
+from .models import ConsoleEvent, NetworkEvent, RunConfig, RunState, SemanticRef, SemanticSnapshot
 from .network_inspector import NetworkInspectorFeature
-from .page_actions import PageActionsFeature
+from .ref_page_actions import PageActionsFeature
+from .semantic_snapshot import SemanticSnapshotManager
 from .session import BrowserSessionManager
 
 __all__ = [
     "BrowserAutomation",
+    "BrowserController",
     "BrowserEventLogger",
     "BrowserSessionManager",
     "ConsoleEvent",
@@ -19,4 +22,7 @@ __all__ = [
     "PageActionsFeature",
     "RunConfig",
     "RunState",
+    "SemanticRef",
+    "SemanticSnapshot",
+    "SemanticSnapshotManager",
 ]

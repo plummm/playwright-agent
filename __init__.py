@@ -1,5 +1,5 @@
 """Playwright agent package."""
 
-from .agents import PlaywrightAgent
+from .single_loop_agent import PlaywrightAgent
 
 __all__ = ["PlaywrightAgent"]
