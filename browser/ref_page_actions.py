@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import StructuredTool
 from moose.framework.llm_core import LLMClient, Message, MessageRole, create_llm_client_from_config
+from moose.framework.llm_core.tool_runtime import ToolRuntime
 
 from .controller import BrowserController
 from .event_logger import BrowserEventLogger
@@ -223,6 +224,15 @@ class PageActionsFeature:
             ),
             system_message=self.screenshot_analyzer_system_prompt or None,
         )
+        runtime = ToolRuntime.current()
+        if runtime is not None:
+            try:
+                runtime.add_external_llm_usage(
+                    usage=getattr(response, "usage", None),
+                    cost=getattr(response, "cost", None),
+                )
+            except Exception:
+                pass
         return _llm_content_to_text(getattr(response, "content", "")).strip() or (
             "I could not determine a reliable conclusion from the screenshot."
         )
