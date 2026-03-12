@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import base64
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -87,9 +88,13 @@ class BrowserController:
         if not callable(get_delta):
             return None
         try:
-            return get_delta(run_state, cursor)
+            delta = get_delta(run_state, cursor)
         except Exception:
             return None
+        if isinstance(delta, dict):
+            delta.pop("requests", None)
+            delta.pop("console", None)
+        return delta
 
     async def ensure_page(self, run_state: Optional[RunState] = None):
         current = run_state or self._require_run_state()
@@ -246,25 +251,22 @@ class BrowserController:
         self._log_action(run_state, action="close_tab", payload=payload)
         return payload
 
-    def _resolve_screenshot_path(self, run_state: RunState, path: Optional[str]) -> Path:
-        if path:
-            return Path(path).expanduser()
+    def _resolve_screenshot_path(self, run_state: RunState) -> Path:
         root = Path((run_state.metadata or {}).get("screenshots_dir", "/tmp/playwright_agent"))
-        ts = int(time.time() * 1000)
-        return root / f"{run_state.run_id}_{ts}.png"
+        root.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=f"{run_state.run_id}_", suffix=".png", dir=str(root))
+        os.close(fd)
+        return Path(temp_path)
 
     async def screenshot(
         self,
         run_state: RunState,
         *,
-        path: Optional[str] = None,
         full_page: bool = True,
     ) -> Dict[str, Any]:
         page = await self.ensure_page(run_state)
-        screenshot_path = self._resolve_screenshot_path(run_state, path)
-        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-        screenshot_bytes = await page.screenshot(path=str(screenshot_path), full_page=bool(full_page))
-        encoded = base64.b64encode(bytes(screenshot_bytes or b"")).decode("ascii")
+        screenshot_path = self._resolve_screenshot_path(run_state)
+        await page.screenshot(path=str(screenshot_path), full_page=bool(full_page))
         title = ""
         try:
             title = str(await page.title() or "")
@@ -278,16 +280,11 @@ class BrowserController:
             "full_page": bool(full_page),
             "active_tab_id": run_state.active_page_id,
             "mime_type": "image/png",
-            "base64": encoded,
         }
         self._log_action(
             run_state,
             action="screenshot",
-            payload={
-                **result,
-                "base64": "<omitted>",
-                "base64_length": len(encoded),
-            },
+            payload=result,
         )
         return result
 

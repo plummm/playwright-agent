@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from moose.framework.llm_core import LLMClient
+from moose.framework.llm_core import LLMClient, create_llm_client_from_config
 
 from .downloads import DownloadsFeature
 from .models import RunConfig
@@ -33,23 +33,23 @@ class BrowserAutomation:
         self.llm_settings = llm_settings or {}
         self.logger = logger
 
-    def _create_worker_llm_client(self, *, tools: List[Any]) -> LLMClient:
-        cfg = self.llm_settings or {}
-        model = str(cfg.get("model") or "gpt-5.2")
-        temperature = float(cfg.get("temperature", 0.2))
-        enable_web_search = bool(cfg.get("enable_web_search", False))
-        max_tool_iterations = max(1, int(cfg.get("max_tool_iterations", 24) or 24))
-        kwargs = cfg.get("kwargs", {})
-        if not isinstance(kwargs, dict):
-            kwargs = {}
+    def _create_worker_llm_client(
+        self, *, tools: List[Any], run_config: Optional[RunConfig] = None
+    ) -> LLMClient:
+        cfg = dict(self.llm_settings or {})
+        cfg_kwargs = dict(cfg.get("kwargs") or {}) if isinstance(cfg.get("kwargs"), dict) else {}
+        runtime_overrides: Dict[str, Any] = {}
+        # So upload_image_sync uses the same timeout as browser (timeout_ms → seconds)
+        if run_config is not None and "timeout" not in cfg and "timeout" not in cfg_kwargs:
+            timeout_ms = getattr(run_config, "timeout_ms", None)
+            if timeout_ms is not None and int(timeout_ms) > 0:
+                runtime_overrides["timeout"] = int(timeout_ms) / 1000.0
 
-        return LLMClient(
-            model=model,
-            temperature=temperature,
-            enable_web_search=enable_web_search,
+        return create_llm_client_from_config(
+            cfg,
             tools=tools,
-            max_tool_iterations=max_tool_iterations,
-            **kwargs,
+            agent_name="playwright_agent",
+            runtime_overrides=runtime_overrides,
         )
 
     def _build_task_message(self, run_config: RunConfig) -> str:
@@ -151,6 +151,20 @@ class BrowserAutomation:
             "activity_db_path": str(getattr(self.page_actions.event_logger, "db_path", "")),
         }
 
+    def _sanitize_loop_payload(self, payload: Any) -> Any:
+        """Remove provider-native raw responses from the Playwright return payload."""
+        if isinstance(payload, dict):
+            return {
+                str(key): self._sanitize_loop_payload(value)
+                for key, value in payload.items()
+                if str(key) != "raw_response"
+            }
+        if isinstance(payload, list):
+            return [self._sanitize_loop_payload(item) for item in payload]
+        if isinstance(payload, tuple):
+            return [self._sanitize_loop_payload(item) for item in payload]
+        return payload
+
     async def run(
         self,
         *,
@@ -209,13 +223,13 @@ class BrowserAutomation:
                 await self.downloads.attach_listener(run_state)
 
             browser_tools = tools if isinstance(tools, list) and tools else self.page_actions.get_tools()
-            llm = self._create_worker_llm_client(tools=browser_tools)
+            llm = self._create_worker_llm_client(tools=browser_tools, run_config=run_config)
             loop_result = await llm.collect_agent_loop(
                 message=resolved_prompt,
                 system_message=run_config.system_prompt or None,
                 raise_on_error=False,
             )
-            loop_payload = loop_result.to_dict()
+            loop_payload = self._sanitize_loop_payload(loop_result.to_dict())
             if not include_loop_events:
                 loop_payload.pop("events", None)
 

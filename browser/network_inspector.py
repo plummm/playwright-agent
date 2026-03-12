@@ -18,6 +18,23 @@ from .session import BrowserSessionManager
 from .tooling import mcp_tool
 
 
+def _extract_html_text(html_content: str, *, max_chars: int = 500_000) -> str:
+    """Extract plain text from HTML using BeautifulSoup."""
+    from bs4 import BeautifulSoup, Comment  # type: ignore
+
+    soup = BeautifulSoup(str(html_content or ""), "html.parser")
+    for tag in soup(["script", "style", "noscript", "template", "iframe", "svg"]):
+        tag.decompose()
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+
+    text = " ".join(soup.stripped_strings)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        return text[:max_chars] + "..."
+    return text
+
+
 class NetworkInspectorFeature:
     """Capture and inspect network + console activity."""
 
@@ -357,6 +374,7 @@ class NetworkInspectorFeature:
             url_contains=url_contains,
             url_regex=url_regex,
         )
+        items = [self._summarize_request_entry(i) for i in items]
         return self._paginate(items, limit=limit, offset=offset)
 
     async def list_console(
@@ -504,6 +522,86 @@ class NetworkInspectorFeature:
             "body": body_meta.get("body"),
             "body_size": body_meta.get("size"),
             "body_truncated": body_meta.get("truncated"),
+        }
+
+    async def get_url_text_content(
+        self,
+        run_state: RunState,
+        url: str,
+        *,
+        timeout_ms: int = 15000,
+        max_text_chars: int = 500_000,
+    ) -> Dict[str, Any]:
+        """
+        Fetch a URL and extract plain text from an HTML response.
+        """
+        target = str(url or "").strip()
+        if not target:
+            return {"ok": False, "error": "url_required", "url": ""}
+
+        result = await self.fetch_url_content(run_state, target, timeout_ms=timeout_ms)
+        if not result.get("ok"):
+            return result
+
+        body_kind = str(result.get("body_kind") or "")
+        body = result.get("body")
+        mime_type = str(result.get("mime_type") or "")
+
+        if body_kind == "base64" and isinstance(body, str):
+            try:
+                body = base64.b64decode(body).decode("utf-8", errors="replace")
+                body_kind = "text"
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": "response_not_text",
+                    "url": target,
+                    "mime_type": mime_type,
+                }
+
+        if body_kind != "text" or not isinstance(body, str):
+            return {
+                "ok": False,
+                "error": "response_not_text",
+                "url": target,
+                "mime_type": mime_type,
+            }
+
+        sample = body[:2000].lstrip().lower()
+        looks_like_html = (
+            "html" in mime_type.lower()
+            or "xhtml" in mime_type.lower()
+            or sample.startswith("<!doctype html")
+            or "<html" in sample
+            or "<body" in sample
+            or "<head" in sample
+        )
+        if not looks_like_html:
+            return {
+                "ok": False,
+                "error": "response_not_html",
+                "url": target,
+                "mime_type": mime_type,
+            }
+
+        try:
+            text = _extract_html_text(body, max_chars=max_text_chars)
+        except ModuleNotFoundError:
+            return {
+                "ok": False,
+                "error": "beautifulsoup4_not_installed",
+                "url": target,
+                "mime_type": mime_type,
+            }
+
+        return {
+            "ok": True,
+            "url": target,
+            "status_code": result.get("status_code"),
+            "mime_type": mime_type,
+            "text": text,
+            "text_length": len(text),
+            "body_truncated": bool(result.get("body_truncated")),
         }
 
     def get_delta_cursor(self, run_state: RunState) -> Dict[str, int]:
@@ -1123,37 +1221,39 @@ class NetworkInspectorFeature:
         url_regex: str = "",
     ) -> Dict[str, Any]:
         """
-        List captured network request/response records with filtering and pagination.
+        List captured network requests as metadata-only summaries.
+        This tool doesn't return response body, if you want to inspect the response body, select a url from the list and use `browser_get_url_text` to fetch the response body.
 
-        Args:
-            limit (optional): Max records to return in this page.
-                Effective range: [1..500]. Default: `100`.
-            offset (optional): Zero-based index of first record. Must be integer >= 0.
-                Default: `0`.
-            resource_type (optional): Exact Playwright resource type filter.
-                Common values: [`document`, `stylesheet`, `script`, `image`, `media`,
-                `font`, `xhr`, `fetch`, `eventsource`, `websocket`, `manifest`, `other`].
-                Empty means no resource-type filter.
-            mime_type (optional): Case-insensitive MIME substring filter
-                (e.g. `application/json`, `text/html`, `javascript`).
-            status_min (optional): Minimum HTTP status code (inclusive), e.g. `400`.
-            status_max (optional): Maximum HTTP status code (inclusive), e.g. `599`.
-            url_contains (optional): Case-insensitive URL substring filter.
-            url_regex (optional): URL regex filter (Python regex syntax).
+        Use case
+        - You want to inspect which URLs were requested, filter for interesting resources, and decide which page or asset deserves deeper inspection without sending response bodies back to the model.
 
-        Returns:
-            Dict pagination envelope:
-            - ok (bool): Whether query succeeded.
-            - total (int): Total records after filters.
-            - offset (int): Applied offset.
-            - limit (int): Applied limit.
-            - has_more (bool): Whether more pages exist.
-            - items (list[dict]): Full raw request/response records.
+        Parameters
+        - limit: Maximum number of records to return in one page. Effective range: `1..500`.
+        - offset: Zero-based starting index for pagination.
+        - resource_type: Exact Playwright resource type filter such as `document`, `script`, `xhr`, `fetch`, or `image`.
+        - mime_type: Case-insensitive MIME substring filter such as `application/json` or `text/html`.
+        - status_min: Optional minimum HTTP status code (inclusive).
+        - status_max: Optional maximum HTTP status code (inclusive).
+        - url_contains: Optional case-insensitive URL substring filter.
+        - url_regex: Optional Python-regex filter applied to URLs.
 
-        Examples:
-            await mcp_browser_list_requests(limit=50, offset=0)
-            await mcp_browser_list_requests(mime_type="application/json", url_contains="/api/")
-            await mcp_browser_list_requests(status_min=400, status_max=599)
+        Return value
+        - Pagination envelope:
+          - ok: Whether the query succeeded.
+          - total: Total matching records after filters.
+          - offset: Applied pagination offset.
+          - limit: Applied page size.
+          - has_more: Whether more pages exist.
+          - items: Array of request summaries. Each item may include `request_id`, `event_type`, `method`, `url`, `resource_type`, `status_code`, `mime_type`, `is_download`, `download_reason`, and `error_text`.
+        - No response body or raw content is returned. If the URL is a page you want to inspect visually/semantically, navigate to it and call `browser_snapshot`.
+
+        Concrete example (code)
+
+        ```python
+        browser_list_requests(limit=50, offset=0)
+        browser_list_requests(mime_type="application/json", url_contains="/api/")
+        browser_list_requests(status_min=400, status_max=599)
+        ```
         """
         return await self.list_requests(
             self._require_run_state(),
@@ -1182,30 +1282,32 @@ class NetworkInspectorFeature:
         text_contains: str = "",
     ) -> Dict[str, Any]:
         """
-        List captured browser console/pageerror entries with filtering and pagination.
+        List captured browser console and page-error entries.
 
-        Args:
-            limit (optional): Max records to return in this page.
-                Effective range: [1..500]. Default: `100`.
-            offset (optional): Zero-based index of first record. Must be integer >= 0.
-                Default: `0`.
-            level (optional): Exact console level filter.
-                Common values: [`log`, `info`, `warn`, `error`, `debug`, `pageerror`].
-                Empty means no level filter.
-            text_contains (optional): Case-insensitive text substring filter.
+        Use case
+        - You want to diagnose runtime issues, JavaScript errors, warnings, or expected console output while navigating a page.
 
-        Returns:
-            Dict pagination envelope:
-            - ok (bool): Whether query succeeded.
-            - total (int): Total records after filters.
-            - offset (int): Applied offset.
-            - limit (int): Applied limit.
-            - has_more (bool): Whether more pages exist.
-            - items (list[dict]): Raw console/error entries.
+        Parameters
+        - limit: Maximum number of records to return in one page. Effective range: `1..500`.
+        - offset: Zero-based starting index for pagination.
+        - level: Exact console level filter such as `log`, `info`, `warn`, `error`, `debug`, or `pageerror`.
+        - text_contains: Optional case-insensitive substring filter applied to console text.
 
-        Examples:
-            await mcp_browser_list_console(limit=100, offset=0)
-            await mcp_browser_list_console(level="error", text_contains="failed")
+        Return value
+        - Pagination envelope:
+          - ok: Whether the query succeeded.
+          - total: Total matching records after filters.
+          - offset: Applied pagination offset.
+          - limit: Applied page size.
+          - has_more: Whether more pages exist.
+          - items: Array of captured console/pageerror entries. Entries typically include `level`, `text`, `page_url`, `ts`, and request context when available.
+
+        Concrete example (code)
+
+        ```python
+        browser_list_console(limit=100, offset=0)
+        browser_list_console(level="error", text_contains="failed")
+        ```
         """
         return await self.list_console(
             self._require_run_state(),
@@ -1229,40 +1331,97 @@ class NetworkInspectorFeature:
         encoding: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Fetch stored raw response payload for a captured resource by `request_id` or URL.
+        Retrieve the stored raw response payload for one captured resource.
 
-        Args:
-            url (optional): Exact resource URL to resolve (used when `request_id` is omitted).
-            request_id (optional): Stable captured request ID (preferred lookup key).
-            encoding (optional): Output conversion hint.
-                - `text`: decode base64 payload to UTF-8 when possible
-                - `base64`: base64-encode text payload
-                - None: keep stored representation
-                Allowed values: [`text`, `base64`, null/omitted].
+        Use case
+        - You already identified an interesting request from `browser_list_requests` and want its headers and body for closer inspection.
 
-        Returns:
-            Dict with payload details:
-            - ok (bool): Whether resource lookup succeeded.
-            - request_id (str): Captured request identifier.
-            - url (str): Resource URL.
-            - mime_type (str): Response MIME type.
-            - status_code (int | null): HTTP status code.
-            - response_headers (dict): Raw response headers.
-            - response_body_kind (str): `text` or `base64`.
-            - response_body (str | null): Raw response payload.
-            - response_body_size (int): Original body size in bytes.
-            - response_body_truncated (bool): Whether payload exceeded capture cap.
-            - is_download (bool): Download heuristic outcome.
+        Parameters
+        - url: Exact resource URL to resolve when `request_id` is not provided.
+        - request_id: Stable captured request identifier. This is the preferred lookup key.
+        - encoding: Optional output conversion hint:
+          - `text`: decode a base64 payload to UTF-8 when possible.
+          - `base64`: convert a text payload to base64.
+          - omitted / `None`: keep the stored representation.
 
-        Examples:
-            await mcp_browser_get_resource_source(request_id="0f8fad5b-d9cb-469f-a165-70867728950e")
-            await mcp_browser_get_resource_source(url="https://example.com/app.js", encoding="text")
+        Return value
+        - Dict with resource details:
+          - ok: Whether the lookup succeeded.
+          - request_id: Captured request identifier.
+          - url: Resource URL.
+          - mime_type: Response MIME type.
+          - status_code: HTTP status code, when available.
+          - response_headers: Raw response headers.
+          - response_body_kind: `text` or `base64`.
+          - response_body: Stored payload content.
+          - response_body_size: Original body size in bytes.
+          - response_body_truncated: Whether the stored payload hit the capture limit.
+          - is_download: Whether the response looked like a download.
+
+        Concrete example (code)
+
+        ```python
+        browser_get_resource_source(request_id="0f8fad5b-d9cb-469f-a165-70867728950e")
+        browser_get_resource_source(url="https://example.com/app.js", encoding="text")
+        ```
         """
         return await self.get_resource_source(
             self._require_run_state(),
             url=url,
             request_id=request_id,
             encoding=encoding,
+        )
+
+    @mcp_tool(
+        name="browser_get_url_text",
+        examples=[
+            "browser_get_url_text(url='https://example.com/about')",
+            "browser_get_url_text(url='https://example.com/page', timeout_ms=20000)",
+        ],
+    )
+    async def mcp_browser_get_url_text(
+        self,
+        url: str = "",
+        timeout_ms: int = 15000,
+        max_text_chars: int = 500_000,
+    ) -> Dict[str, Any]:
+        """
+        Fetch a URL and return plain text extracted from its HTML.
+
+        Use case
+        - You want the readable text of a page for analysis, search, or summarization without markup, CSS, or script content.
+
+        Parameters
+        - url: URL to fetch. This must point to an HTML page.
+        - timeout_ms: Request timeout in milliseconds.
+        - max_text_chars: Maximum number of text characters to return.
+
+        Return value
+        - Dict with:
+          - ok: Whether fetching and extraction succeeded.
+          - url: Requested URL.
+          - status_code: HTTP status code, when available.
+          - mime_type: Response MIME type.
+          - text: Plain text extracted from the HTML.
+          - text_length: Character count of `text`.
+          - body_truncated: Whether the fetched body hit the capture limit before extraction.
+        - On failure:
+          - ok: `False`
+          - error: Failure code such as `url_required`, `fetch_failed:...`, `response_not_text`, `response_not_html`, or `beautifulsoup4_not_installed`
+          - url: Requested URL when available.
+
+        Concrete example (code)
+
+        ```python
+        browser_get_url_text(url="https://example.com/about")
+        browser_get_url_text(url="https://example.com/page", timeout_ms=20000)
+        ```
+        """
+        return await self.get_url_text_content(
+            self._require_run_state(),
+            url=url,
+            timeout_ms=timeout_ms,
+            max_text_chars=max_text_chars,
         )
 
     @mcp_tool(
@@ -1279,30 +1438,31 @@ class NetworkInspectorFeature:
         event_type: str = "",
     ) -> Dict[str, Any]:
         """
-        List captured websocket events/frames with pagination.
+        List captured websocket lifecycle events and frame records.
 
-        Args:
-            limit (optional): Max websocket events to return.
-                Effective range: [1..500]. Default: `100`.
-            offset (optional): Zero-based index of first websocket event.
-                Must be integer >= 0. Default: `0`.
-            event_type (optional): Exact websocket event filter.
-                Allowed values: [`websocket_open`, `websocket_frame_received`,
-                `websocket_frame_sent`, `websocket_close`].
-                Empty means no event-type filter.
+        Use case
+        - You want to inspect websocket traffic for live apps, chat systems, dashboards, or other streaming browser flows.
 
-        Returns:
-            Dict pagination envelope:
-            - ok (bool): Whether query succeeded.
-            - total (int): Total websocket records after filter.
-            - offset (int): Applied offset.
-            - limit (int): Applied limit.
-            - has_more (bool): Whether more pages exist.
-            - items (list[dict]): Raw websocket event/frame records.
+        Parameters
+        - limit: Maximum number of websocket records to return. Effective range: `1..500`.
+        - offset: Zero-based pagination offset.
+        - event_type: Optional exact websocket event filter such as `websocket_open`, `websocket_frame_received`, `websocket_frame_sent`, or `websocket_close`.
 
-        Examples:
-            await mcp_browser_list_websocket_frames(limit=100, offset=0)
-            await mcp_browser_list_websocket_frames(event_type="websocket_frame_received")
+        Return value
+        - Pagination envelope:
+          - ok: Whether the query succeeded.
+          - total: Total matching websocket records.
+          - offset: Applied pagination offset.
+          - limit: Applied page size.
+          - has_more: Whether more pages exist.
+          - items: Array of websocket event/frame records. Records typically include `event_type`, `websocket_id`, `url`, and payload fields for sent/received frames.
+
+        Concrete example (code)
+
+        ```python
+        browser_list_websocket_frames(limit=100, offset=0)
+        browser_list_websocket_frames(event_type="websocket_frame_received")
+        ```
         """
         return await self.list_websocket_frames(
             self._require_run_state(),

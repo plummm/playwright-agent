@@ -16,7 +16,7 @@ try:
         load_system_prompt,
         render_prompt_template,
     )
-    from moose.framework.llm_core import LLMClient
+    from moose.framework.llm_core import LLMClient, create_llm_client_from_config
 except ModuleNotFoundError:
     repo_root = Path(__file__).resolve().parents[3]
     if str(repo_root) not in sys.path:
@@ -27,7 +27,7 @@ except ModuleNotFoundError:
         load_system_prompt,
         render_prompt_template,
     )
-    from moose.framework.llm_core import LLMClient
+    from moose.framework.llm_core import LLMClient, create_llm_client_from_config
 
 try:
     from .browser.loop_runtime import BrowserAutomation
@@ -65,19 +65,32 @@ class PlaywrightAgent(BaseAgent):
             custom.get("task_refiner") if isinstance(custom.get("task_refiner"), dict) else {}
         )
         summarizer_cfg = custom.get("summarizer") if isinstance(custom.get("summarizer"), dict) else {}
+        screenshot_analyzer_cfg = (
+            custom.get("screenshot_analyzer") if isinstance(custom.get("screenshot_analyzer"), dict) else {}
+        )
         runtime_cfg = (
             custom.get("browser_runtime") if isinstance(custom.get("browser_runtime"), dict) else {}
         )
+        browser_llm_settings = dict(browser_agent_cfg or {})
+
+        screenshot_analyzer_llm_settings = dict(screenshot_analyzer_cfg or {})
 
         self.browser_agent_cfg: Dict[str, Any] = browser_agent_cfg
         self.task_refiner_cfg: Dict[str, Any] = task_refiner_cfg
         self.summarizer_cfg: Dict[str, Any] = summarizer_cfg
+        self.screenshot_analyzer_cfg: Dict[str, Any] = screenshot_analyzer_cfg
         self.runtime_cfg: Dict[str, Any] = runtime_cfg
         self.browser_system_prompt = load_system_prompt(
             system_prompt_path=str(browser_agent_cfg.get("system_prompt_path") or ""),
             skills_dir=str(browser_agent_cfg.get("skills_dir") or ""),
             logger=self.logger,
             label="playwright_agent.custom.browser_agent.system_prompt_path",
+            required=True,
+        )
+        self.screenshot_analyzer_system_prompt = load_prompt_text(
+            path=str(screenshot_analyzer_cfg.get("system_prompt_path") or ""),
+            logger=self.logger,
+            label="playwright_agent.custom.screenshot_analyzer.system_prompt_path",
             required=True,
         )
         self.task_refiner_system_prompt = load_prompt_text(
@@ -113,6 +126,9 @@ class PlaywrightAgent(BaseAgent):
         self.page_actions = PageActionsFeature(
             session_manager=self.session_manager,
             event_logger=self.event_logger,
+            llm_settings=browser_llm_settings,
+            screenshot_analyzer_llm_settings=screenshot_analyzer_llm_settings,
+            screenshot_analyzer_system_prompt=self.screenshot_analyzer_system_prompt,
         )
         self.network_inspector = NetworkInspectorFeature(
             session_manager=self.session_manager,
@@ -129,17 +145,7 @@ class PlaywrightAgent(BaseAgent):
             page_actions=self.page_actions,
             network_inspector=self.network_inspector,
             downloads=self.downloads,
-            llm_settings={
-                "model": str(browser_agent_cfg.get("model") or "gpt-5.2"),
-                "temperature": float(browser_agent_cfg.get("temperature", 0.2)),
-                "enable_web_search": bool(browser_agent_cfg.get("enable_web_search", False)),
-                "max_tool_iterations": int(browser_agent_cfg.get("max_tool_iterations", 24) or 24),
-                "kwargs": (
-                    dict(browser_agent_cfg.get("kwargs"))
-                    if isinstance(browser_agent_cfg.get("kwargs"), dict)
-                    else {}
-                ),
-            },
+            llm_settings=browser_llm_settings,
             logger=self.logger,
         )
 
@@ -268,33 +274,15 @@ class PlaywrightAgent(BaseAgent):
         return resolved if resolved > 0 else fallback
 
     def _create_task_refiner_llm_client(self) -> LLMClient:
-        cfg = self.task_refiner_cfg or {}
-        model = str(cfg.get("model") or "gpt-5.2")
-        temperature = float(cfg.get("temperature", 0.0))
-        enable_web_search = bool(cfg.get("enable_web_search", False))
-        kwargs = cfg.get("kwargs", {})
-        if not isinstance(kwargs, dict):
-            kwargs = {}
-        return LLMClient(
-            model=model,
-            temperature=temperature,
-            enable_web_search=enable_web_search,
-            **kwargs,
+        return create_llm_client_from_config(
+            self.task_refiner_cfg,
+            agent_name=self.name,
         )
 
     def _create_summarizer_llm_client(self) -> LLMClient:
-        cfg = self.summarizer_cfg or {}
-        model = str(cfg.get("model") or "gpt-5.2")
-        temperature = float(cfg.get("temperature", 0.1))
-        enable_web_search = bool(cfg.get("enable_web_search", False))
-        kwargs = cfg.get("kwargs", {})
-        if not isinstance(kwargs, dict):
-            kwargs = {}
-        return LLMClient(
-            model=model,
-            temperature=temperature,
-            enable_web_search=enable_web_search,
-            **kwargs,
+        return create_llm_client_from_config(
+            self.summarizer_cfg,
+            agent_name=self.name,
         )
 
     async def _run_task_refiner(self, payload: Dict[str, Any]) -> Dict[str, Any]:

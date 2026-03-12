@@ -258,7 +258,27 @@ class DownloadsFeature:
         examples=["browser_list_downloads(limit=10)"],
     )
     async def mcp_browser_list_downloads(self, limit: int = 100) -> Dict[str, Any]:
-        """List downloads detected during the current browser run."""
+        """
+        List downloads detected during the current browser run.
+
+        Use case
+        - You want to see which files have been offered or saved by the site before deciding whether to inspect or persist one of them.
+
+        Parameters
+        - limit: Maximum number of downloads to return, ordered from newest to oldest.
+
+        Return value
+        - Dict with download inventory:
+          - ok: Whether the listing succeeded.
+          - count: Number of download records returned.
+          - downloads: Array of normalized download records. Records may include `download_id`, `url`, `suggested_filename`, `status`, `mime_type`, `saved_path`, and timestamps.
+
+        Concrete example (code)
+
+        ```python
+        browser_list_downloads(limit=10)
+        ```
+        """
         return await self.list_downloads(self._require_run_state(), limit=limit)
 
     @mcp_tool(
@@ -266,7 +286,26 @@ class DownloadsFeature:
         examples=["browser_get_download(download_id='download_1')"],
     )
     async def mcp_browser_get_download(self, download_id: str) -> Dict[str, Any]:
-        """Inspect metadata for one detected download."""
+        """
+        Retrieve metadata for one detected download.
+
+        Use case
+        - You already know the download id and want detailed metadata before deciding whether to save or ignore the file.
+
+        Parameters
+        - download_id: Download identifier returned by `browser_list_downloads` or `browser_wait_for_download`.
+
+        Return value
+        - Dict with one download record:
+          - ok: Whether the lookup succeeded.
+          - download: Normalized download metadata such as `download_id`, `url`, `suggested_filename`, `status`, `mime_type`, `saved_path`, and timestamps.
+
+        Concrete example (code)
+
+        ```python
+        browser_get_download(download_id="download_1")
+        ```
+        """
         return await self.get_download(self._require_run_state(), download_id=download_id)
 
     @mcp_tool(
@@ -281,7 +320,30 @@ class DownloadsFeature:
         download_id: str,
         destination_path: str = "",
     ) -> Dict[str, Any]:
-        """Persist a detected download to disk and return the saved path."""
+        """
+        Save a detected browser download to disk.
+
+        Use case
+        - The page triggered a download and you want the file persisted to a known location for later inspection or handoff.
+
+        Parameters
+        - download_id: Download identifier returned by the downloads tools.
+        - destination_path: Optional full destination path. If omitted, the tool saves into the run downloads directory using the suggested filename.
+
+        Return value
+        - Dict describing the saved file:
+          - ok: Whether the save succeeded.
+          - download_id: Download identifier that was saved.
+          - saved_path: Final on-disk path of the saved file.
+          - suggested_filename: Browser-provided filename hint, when available.
+
+        Concrete example (code)
+
+        ```python
+        browser_save_download(download_id="download_1")
+        browser_save_download(download_id="download_1", destination_path="/tmp/file.pdf")
+        ```
+        """
         return await self.save_download(
             self._require_run_state(),
             download_id=download_id,
@@ -293,5 +355,24 @@ class DownloadsFeature:
         examples=["browser_wait_for_download(timeout_ms=15000)"],
     )
     async def mcp_browser_wait_for_download(self, timeout_ms: int = 15000) -> Dict[str, Any]:
-        """Wait until a new browser download is detected."""
+        """
+        Wait until a new browser download is detected.
+
+        Use case
+        - You just clicked a download link or submit action and need to pause until the browser reports a new download.
+
+        Parameters
+        - timeout_ms: Maximum wait time in milliseconds before raising a timeout.
+
+        Return value
+        - Dict with the first newly detected download:
+          - ok: Whether a new download was detected before timeout.
+          - download: Normalized download metadata such as `download_id`, `url`, `suggested_filename`, `status`, `mime_type`, `saved_path`, and timestamps.
+
+        Concrete example (code)
+
+        ```python
+        browser_wait_for_download(timeout_ms=15000)
+        ```
+        """
         return await self.wait_for_download(self._require_run_state(), timeout_ms=timeout_ms)
